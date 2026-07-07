@@ -9,8 +9,11 @@ build/
 extern/
 community-shaders/
 
-# ---- Deployed binaries (shaders under dist/ ARE source and stay tracked) ----
-dist/**/*.dll
+# ---- Local mod folder / build output (NEVER published; shader SOURCE lives in /Shaders) ----
+dist/
+
+# ---- Dev screenshots (not part of the project) ----
+screenshots/
 
 # ---- Logs (runtime + transient build logs) ----
 *.log

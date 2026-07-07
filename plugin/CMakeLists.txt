@@ -39,16 +39,18 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     imgui::imgui
     d3d11 dxgi d3dcompiler)
 
-# ---- Deploy the built plugin into the distributable mod folder --------------------------------
-# The mod ships as an MO2-ready tree at "<repo>/dist/Virtual Shadow Maps/":
+# ---- Deploy into the LOCAL mod folder (dist/) -------------------------------------------------
+# dist/ is a local, git-ignored MO2-ready tree — it is NOT published to GitHub. Layout:
 #   SKSE/Plugins/VirtualShadowMaps.dll   <- this target (auto-copied below)
 #   SKSE/Plugins/CommunityShaders.dll    <- the minimally-hooked CS build (maintained separately)
-#   Shaders/...                          <- our CS shader overrides (Lighting.hlsl / *.hlsli)
-# Every build refreshes the DLL in the mod folder so "dist" is always the shippable package.
+#   Shaders/...                          <- copied from the tracked /Shaders source tree
+# Every build refreshes the DLL and the shader overrides so dist/ mirrors the current source.
 set(VSM_MOD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../dist/Virtual Shadow Maps")
 set(VSM_MOD_PLUGINS "${VSM_MOD_DIR}/SKSE/Plugins")
+set(VSM_SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../Shaders")
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${VSM_MOD_PLUGINS}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${PROJECT_NAME}>" "${VSM_MOD_PLUGINS}/"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${VSM_SHADER_SRC}" "${VSM_MOD_DIR}/Shaders"
     VERBATIM
-    COMMENT "Deploying VirtualShadowMaps.dll -> dist/Virtual Shadow Maps/SKSE/Plugins/")
+    COMMENT "Deploying VirtualShadowMaps.dll + shaders -> dist/Virtual Shadow Maps/")

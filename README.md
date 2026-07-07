@@ -54,11 +54,12 @@ plugin/src/
   VSMInternal.h                      helpers shared across the two translation units
   VSMConfig.{h,cpp}                  TOML config + settings persistence
   Plugin.cpp                         SKSE entry points + the Present / OMSetRenderTargets hooks
-dist/Virtual Shadow Maps/Shaders/    shipped CS shader overrides (see License below)
+Shaders/                             CS shader overrides — VSM.hlsli (ours) + CS-derived edits (see License)
 DESIGN.md, VSM_PHASE_*.md            design + roadmap notes
 ```
 
-`extern/` (CommonLibSSE-NG, vcpkg) and `community-shaders/` are not committed — see Building.
+`extern/` (CommonLibSSE-NG, vcpkg), `community-shaders/`, and the built `dist/` mod folder are not
+committed — see Building.
 
 ## Building
 
@@ -74,7 +75,8 @@ Requirements: Windows, Visual Studio 2022+ with the C++ workload, CMake 3.21+, a
      -DCMAKE_TOOLCHAIN_FILE=extern/vcpkg/scripts/buildsystems/vcpkg.cmake
    cmake --build plugin/build --config Release
    ```
-   The build deploys `VirtualShadowMaps.dll` into `dist/Virtual Shadow Maps/SKSE/Plugins/`.
+   The build deploys the DLL and copies the `Shaders/` overrides into `dist/Virtual Shadow Maps/` —
+   a local, git-ignored mod folder (not published).
 
 The in-menu panel additionally requires a **minimally-hooked `CommunityShaders.dll`** built from a
 Community Shaders **v1.7.3** checkout with a ~7-line generic add-on hook in `Menu.cpp` (two exports
@@ -82,7 +84,7 @@ Community Shaders **v1.7.3** checkout with a ~7-line generic add-on hook in `Men
 
 ## Installing
 
-The mod is two DLLs plus the shader overrides, as an MO2-ready tree under `dist/Virtual Shadow Maps/`:
+The build produces an MO2-ready tree in `dist/Virtual Shadow Maps/` (local only — not part of this repo):
 
 ```
 SKSE/Plugins/VirtualShadowMaps.dll     this plugin
@@ -97,7 +99,7 @@ defaults on first launch) and are also editable live from the Community Shaders 
 
 This project is licensed under **GPL-3.0** (see [`LICENSE`](LICENSE)).
 
-The files under `dist/Virtual Shadow Maps/Shaders/` — notably `Lighting.hlsl` and the Light Limit
+The files under `Shaders/` — notably `Lighting.hlsl` and the Light Limit
 Fix `.hlsli` files — are **derived from [Community Shaders](https://github.com/doodlum/skyrim-community-shaders)**,
 which is licensed under GPL-3.0, and are redistributed here under the same license with our additions
 (the `VSM::` sampling path and a small diagnostic override). All original plugin code in `plugin/`
