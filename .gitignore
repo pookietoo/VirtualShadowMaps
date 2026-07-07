@@ -1,0 +1,25 @@
+# ---- Build output ----
+plugin/build/
+build/
+*.obj
+*.pdb
+*.ilk
+
+# ---- Vendored dependencies (large, reproducible via cmake/vcpkg) ----
+extern/
+community-shaders/
+
+# ---- Deployed binaries (shaders under dist/ ARE source and stay tracked) ----
+dist/**/*.dll
+
+# ---- Logs (runtime + transient build logs) ----
+*.log
+
+# ---- Holding area for removed code (user empties this) ----
+trash/
+
+# ---- OS / editor ----
+.vs/
+*.user
+Thumbs.db
+desktop.ini

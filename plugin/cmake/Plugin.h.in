@@ -1,0 +1,9 @@
+#pragma once
+
+namespace Plugin
+{
+	using namespace std::literals;
+
+	inline constexpr auto NAME = "@PROJECT_NAME@"sv;
+	inline constexpr auto VERSION = "@PROJECT_VERSION@"sv;
+}

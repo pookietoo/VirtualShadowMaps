@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "virtual-shadow-maps",
+  "version-string": "0.1.0",
+  "builtin-baseline": "ee12231b20c95013c6638d845d04c91559a1d1ff",
+  "dependencies": [
+    "directxmath",
+    "directxtk",
+    "fmt",
+    "rapidcsv",
+    "spdlog",
+    "xbyak",
+    {
+      "name": "imgui",
+      "features": ["dx11-binding", "win32-binding", "docking-experimental"]
+    }
+  ],
+  "overrides": [
+    { "name": "imgui", "version": "1.92.6" }
+  ]
+}
