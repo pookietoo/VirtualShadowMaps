@@ -478,8 +478,8 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 		const uint32_t idx    = static_cast<uint32_t>(lightRecords.size());
 		LightRecord r;
 		r.positionWS = { p.x, p.y, p.z, 1.0f };
-		r.farPlane   = (std::max)(radius * dbgFarScale, 1.0f);          // far  = light radius * FarScale
-		r.nearPlane  = (std::max)(r.farPlane * dbgNearFrac, 0.1f);      // near = far * NearFrac
+		r.farPlane   = (std::max)(radius * shadowFarScale, 1.0f);          // far  = light radius * FarScale
+		r.nearPlane  = (std::max)(r.farPlane * shadowNearFrac, 0.1f);      // near = far * NearFrac
 		r.atlasCol   = idx % static_cast<uint32_t>(kLightsPerRow);
 		r.atlasRow   = idx / static_cast<uint32_t>(kLightsPerRow);
 		BuildCubeMatrices(XMVectorSet(p.x, p.y, p.z, 1.0f), r.nearPlane, r.farPlane, r.cubeVP);
@@ -563,7 +563,7 @@ void VirtualShadowMaps::UpdateDebugCB()
 	const RE::NiPoint3 eye{ sceneCameraPos.x, sceneCameraPos.y, sceneCameraPos.z };
 
 	const VSMDebugCB cb{
-		dbgBiasWorld, dbgMode, dbgVizScale, dbgSampleSpace,   // row 0
+		shadowBiasWorld, dbgMode, dbgVizScale, dbgSampleSpace,   // row 0
 		dbgMatchThresh, dbgCompareMode, dbgMatchEye, 0.0f,    // row 1 (spare = 0)
 		eye.x, eye.y, eye.z, probeArmed ? 1 : 0,             // row 2 (probeArmed -> write pixel probe to u8)
 	};
@@ -611,7 +611,7 @@ void VirtualShadowMaps::RebuildRegistrySafe(RE::NiAVObject* a_obj)
 {
 	__try {
 		registrySeen.clear();
-		rejNoRD = rejNoVB = rejNoIB = rejZeroTris = rejDup = 0;
+		rejectedNoRenderData = rejectedNoVertexBuffer = rejectedNoIndexBuffer = rejectedZeroTriangles = rejectedDuplicate = 0;
 		RebuildRegistry(a_obj, 0);   // ShadowSceneNode (sky/LOD skipped) — mostly sky in interiors
 		RebuildFromReferences();     // player + loaded-cell references: room shell, clutter, NPCs, player
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -674,13 +674,13 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth)
 				e.engineOnly = true;  // vertexStride/indexCount stay 0
 				registry.push_back(std::move(e));
 			} else {
-				++rejNoRD;
+				++rejectedNoRenderData;
 			}
 		}
-		else if (!rd->vertexBuffer)                                             ++rejNoVB;
-		else if (!rd->indexBuffer)                                              ++rejNoIB;
-		else if (!triCount)                                                     ++rejZeroTris;
-		else if (!registrySeen.insert(static_cast<RE::BSGeometry*>(tri)).second) ++rejDup;
+		else if (!rd->vertexBuffer)                                             ++rejectedNoVertexBuffer;
+		else if (!rd->indexBuffer)                                              ++rejectedNoIndexBuffer;
+		else if (!triCount)                                                     ++rejectedZeroTriangles;
+		else if (!registrySeen.insert(static_cast<RE::BSGeometry*>(tri)).second) ++rejectedDuplicate;
 		else {
 			CasterEntry e;
 			e.geom         = RE::NiPointer<RE::BSGeometry>(tri);  // add-ref: keep alive between rebuilds
@@ -1069,9 +1069,9 @@ void VirtualShadowMaps::DrawMenu()
 	                   "7/10 green near lights, 16 green near lights, 18 BLACK. Flip to space 1 to see the "
 	                   "old broken behavior for comparison.");
 	ImGui::Text("far = radius x FarScale ; near = far x NearFrac ; shadow if pixel-occluder > Bias");
-	ImGui::SliderFloat("FarScale (x radius)##VSM", &dbgFarScale, 0.25f, 4.0f, "%.2f");
-	ImGui::SliderFloat("NearFrac (x far)##VSM", &dbgNearFrac, 0.001f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic);
-	ImGui::SliderFloat("Bias (world units)##VSM", &dbgBiasWorld, 0.0f, 50.0f, "%.1f");
+	ImGui::SliderFloat("FarScale (x radius)##VSM", &shadowFarScale, 0.25f, 4.0f, "%.2f");
+	ImGui::SliderFloat("NearFrac (x far)##VSM", &shadowNearFrac, 0.001f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic);
+	ImGui::SliderFloat("Bias (world units)##VSM", &shadowBiasWorld, 0.0f, 50.0f, "%.1f");
 	ImGui::SliderFloat("Match threshold (world units)##VSM", &dbgMatchThresh, 0.5f, 200.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
 	ImGui::SliderFloat("Depth-view scale (debug)##VSM", &dbgVizScale, 100.0f, 8192.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
 	ImGui::Separator();

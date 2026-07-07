@@ -143,7 +143,7 @@ private:
 	std::vector<CasterEntry> registry;             // persistent; rebuilt only when geometry streams in/out
 	std::unordered_set<RE::BSGeometry*> registrySeen;  // dedup across all capture sources this rebuild
 	// Capture-rejection tally (reset each rebuild): why a BSTriShape we reached was NOT registered.
-	int rejNoRD = 0, rejNoVB = 0, rejNoIB = 0, rejZeroTris = 0, rejDup = 0;
+	int rejectedNoRenderData = 0, rejectedNoVertexBuffer = 0, rejectedNoIndexBuffer = 0, rejectedZeroTriangles = 0, rejectedDuplicate = 0;
 	bool                     registryDirty      = true;
 	uint32_t                 framesSinceRebuild = 0;
 	int                      visibleCasters     = 0;  // drawn this frame (after cull, summed over faces)
@@ -187,9 +187,9 @@ private:
 	//     nearPlane = farPlane     * NearFrac
 	//     shadowed  = (pixelDist - occluderDist) > BiasWorld     // all in WORLD units
 	// Live via debugCB @ b13 (no rebuild). Mode/VizScale are debug-view only.
-	float dbgFarScale  = 1.0f;     // far  = light radius * this
-	float dbgNearFrac  = 0.01f;    // near = far * this (precision knob; smaller = tighter)
-	float dbgBiasWorld = 3.0f;     // shadow bias in WORLD UNITS (linear-distance compare)
+	float shadowFarScale  = 1.0f;     // far  = light radius * this
+	float shadowNearFrac  = 0.01f;    // near = far * this (precision knob; smaller = tighter)
+	float shadowBiasWorld = 3.0f;     // shadow bias in WORLD UNITS (linear-distance compare)
 	int   dbgMode      = 0;        // 0 = shadow  1 = off(lit)  >=2 RGB diagnostic overlays
 	float dbgVizScale  = 2000.0f;  // grayscale scale for the atlas-depth view (debug only)
 

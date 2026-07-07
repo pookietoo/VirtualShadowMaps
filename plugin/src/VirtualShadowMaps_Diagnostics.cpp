@@ -530,7 +530,7 @@ void VirtualShadowMaps::DumpDiagnosticLog()
 	logger::info("MODE={}  (0=REAL shadow; 1=off/lit; >=2=RGB debug — the shader casts NO shadow unless MODE==0)  enabled={}",
 	    dbgMode, enabled ? 1 : 0);
 	logger::info("bias(world)={:.2f} matchThresh={:.2f} FarScale={:.2f} NearFrac={:.3f} sampleSpace={} compareMode={} matchEye={}",
-	    dbgBiasWorld, dbgMatchThresh, dbgFarScale, dbgNearFrac, dbgSampleSpace, dbgCompareMode, dbgMatchEye);
+	    shadowBiasWorld, dbgMatchThresh, shadowFarScale, shadowNearFrac, dbgSampleSpace, dbgCompareMode, dbgMatchEye);
 	logger::info("atlas {}x{}  kFaceRes={} kBlockW={} kBlockH={}  lights={} registry={} visibleCasters={}",
 	    kAtlasW, kAtlasH, kFaceRes, kBlockW, kBlockH, lightRecords.size(), registry.size(), visibleCasters);
 	logger::info("light filter: shadow-casters(added)={} ambient(skipped)={} nonShadow(skipped)={}  (only IsShadowLight()==true & !ambient cast shadows)",
@@ -572,7 +572,7 @@ void VirtualShadowMaps::DumpDiagnosticLog()
 	}
 
 	logger::info("capture rejections (BSTriShapes reached but NOT registered): noRendererData={} noVertexBuffer={} noIndexBuffer={} zeroTris={} duplicate={}",
-	    rejNoRD, rejNoVB, rejNoIB, rejZeroTris, rejDup);
+	    rejectedNoRenderData, rejectedNoVertexBuffer, rejectedNoIndexBuffer, rejectedZeroTriangles, rejectedDuplicate);
 
 	// ---- Skinned-geometry probe (Path B): what buffers/data are ACTUALLY available at Present time for
 	// the skinned casters, so we build the compute-skinning path from real data, not assumptions. ----
@@ -875,7 +875,7 @@ void VirtualShadowMaps::DumpDiagnosticLog()
 		// project in-bounds vs get clipped beyond far / before near / behind. High beyondFar => the
 		// far plane (radius x FarScale) is too small and nearby geometry casts/receives no shadow.
 		{
-			const float radius = L.farPlane / (std::max)(dbgFarScale, 1e-3f);
+			const float radius = L.farPlane / (std::max)(shadowFarScale, 1e-3f);
 			int inRad = 0, inB = 0, beyF = 0, tooN = 0, behind = 0;
 			for (const auto& e : registry) {
 				RE::BSGeometry* g = e.geom.get();
@@ -932,7 +932,7 @@ void VirtualShadowMaps::DumpDiagnosticLog()
 							const float sv = (L.atlasRow * kBlockH + ((f2 / 3) + (ny * -0.5f + 0.5f)) * kFaceRes) / static_cast<float>(kAtlasH);
 							const float occ = atlasAtUV(su, sv);
 							const float lp = lin(nz, L.nearPlane, L.farPlane), lo = lin(occ, L.nearPlane, L.farPlane);
-							const bool shadow = (lp - lo) > dbgBiasWorld;
+							const bool shadow = (lp - lo) > shadowBiasWorld;
 							logger::info("     synthShadow: pt 100u behind occluder(face {} dist {:.0f}) linPix={:.1f} linOcc={:.1f} diff={:.1f} occ={:.4f} -> {}",
 							    tf, dOcc, lp, lo, lp - lo, occ, shadow ? "SHADOW (logic OK)" : "lit (LOGIC BROKEN)");
 						}
@@ -994,7 +994,7 @@ void VirtualShadowMaps::DumpDiagnosticLog()
 			ProbeCBData cb{};
 			cb.camAdjust   = { altEye.x, altEye.y, altEye.z, 0.0f };
 			cb.altEye      = { altEye.x, altEye.y, altEye.z, 0.0f };
-			cb.bias        = dbgBiasWorld; cb.compareMode = dbgCompareMode; cb.matchEye = dbgMatchEye; cb.sampleSpace = dbgSampleSpace;
+			cb.bias        = shadowBiasWorld; cb.compareMode = dbgCompareMode; cb.matchEye = dbgMatchEye; cb.sampleSpace = dbgSampleSpace;
 			cb.matchThresh = dbgMatchThresh; cb.numProbes = pc; cb.pad0 = 0; cb.pad1 = 0;
 			std::memcpy(mc.pData, &cb, sizeof(cb));
 			context->Unmap(probeCB.Get(), 0);
