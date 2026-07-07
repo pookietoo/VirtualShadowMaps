@@ -8,7 +8,9 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include <limits>
+#include <string>
 #include <vector>
 
 // Path B (skinned characters): read skin partitions + the engine bone-matrix palette, CPU-skin, render.
@@ -19,25 +21,34 @@
 #include "RE/N/NiSkinPartition.h"       // bind-pose buffers + bone indices/weights per partition
 
 using namespace DirectX;
+using namespace vsm;  // atlas geometry + capacities (VSMConstants.h)
 
 namespace
 {
-	// Bump this every build so the menu confirms the plugin DLL actually updated. (Shader
-	// changes are separate — the shader debug tint below confirms those.)
+	// Human-readable build label shown in the menu + diagnostic dump, so it's obvious which
+	// plugin DLL is actually running. Bump the description each build. (The SKSE plugin
+	// version number is separate — see Plugin.h / CMake project VERSION.)
 	constexpr char kBuildTag[] = "0.9.35 per-light jitter detector: BSLight::dynamic + per-frame position delta (find the moving shadow light)";
 
 	// Skyrim's main view is reverse-Z. Flip if the dumped map looks inverted; drives
 	// the depth clear value + DepthFunc (single source of truth).
 	constexpr bool kReverseZ = false;
 
-	// Light perspective near/far (must match kNear/kFar in the linearize PS below).
-	constexpr float kNear = 8.0f;
-	constexpr float kFar  = 8192.0f;
+	// Emit the shared atlas constants as an HLSL declaration line, so the embedded preview
+	// and probe shaders below are generated from the SAME values as the C++ code (vsm::) and
+	// can never silently diverge. Prepended to each generated shader source at compile time.
+	std::string MakeAtlasConstantsHLSL()
+	{
+		return std::format(
+		    "static const int kFaceRes={}, kMaxLights={}, kBlockW={}, kBlockH={}, kAtlasW={}, kAtlasH={};\n",
+		    kFaceRes, kMaxLights, kBlockW, kBlockH, kAtlasW, kAtlasH);
+	}
 
-	// Re-traverse the scene graph to rebuild the persistent registry at most this often
-	// (frames). Between rebuilds each live geometry's buffers/transform are re-read, so
-	// this interval only bounds how quickly streamed-in/out geometry is picked up.
-	constexpr uint32_t kRebuildInterval = 30;
+	// Same idea for the debug preview linearizer's near/far planes (vsm::kPreviewNear/kPreviewFar).
+	std::string MakePreviewConstantsHLSL()
+	{
+		return std::format("static const float kNear={:.1f}, kFar={:.1f};\n", kPreviewNear, kPreviewFar);
+	}
 
 	// Embedded depth-only VS (position -> light clip). Row-vector: mul(v, M).
 	constexpr char kDepthVS[] = R"(
@@ -56,12 +67,12 @@ VSOut main(uint id : SV_VertexID) {
 	return o;
 }
 )";
+	// kNear/kFar are prepended at compile time from vsm::kPreviewNear/kPreviewFar
+	// (see MakePreviewConstantsHLSL / SetupResources) so they can't drift from the C++ side.
 	constexpr char kLinearizePS[] = R"(
 Texture2D DepthTex : register(t0);
 SamplerState Samp  : register(s0);
 cbuffer PreviewCB : register(b0) { float PreviewRange; float3 _pad; };
-static const float kNear = 8.0;
-static const float kFar  = 8192.0;
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float d = DepthTex.Sample(Samp, uv).r;
 	float z = kNear * kFar / max(kFar - d * (kFar - kNear), 1e-4);  // perspective -> view-space Z (world units)
@@ -74,6 +85,24 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	{
 		XMFLOAT4X4 WorldViewProj;
 	};
+
+	// Preview linearizer cbuffer (b0 of the debug preview pass): one float + padding to 16 bytes.
+	struct alignas(16) PreviewCBData
+	{
+		float previewRange;
+		float pad[3];
+	};
+
+	// Live tuning cbuffer shared with the game's Lighting.hlsl at b13 (VSM.hlsli::VSMDebug).
+	// Exactly three float4 rows; the field order/types below MUST match VSM.hlsli or the shader
+	// reads garbage. Populated by UpdateDebugCB, sized via sizeof here and in SetupResources.
+	struct alignas(16) VSMDebugCB
+	{
+		float biasWorld;   int mode;        float vizScale;  int sampleSpace;  // row 0
+		float matchThresh; int compareMode; int matchEye;    float spare;      // row 1
+		float altEyeX;     float altEyeY;   float altEyeZ;   int probeArmed;   // row 2
+	};
+	static_assert(sizeof(VSMDebugCB) == 48, "VSMDebugCB must stay three float4 rows to match VSM.hlsli::VSMDebug");
 
 	// ---- GPU shadow-math probe (see VirtualShadowMaps.h). One thread per probe point runs the
 	// EXACT VSM::GetLocalShadow logic against the live atlas + light buffer and writes every
@@ -131,7 +160,7 @@ StructuredBuffer<LightRecord> Lights : register(t1);
 StructuredBuffer<ProbeIn>     Probes : register(t2);
 SamplerState                  Samp   : register(s0);
 RWStructuredBuffer<ProbeOut>  Out    : register(u0);
-static const int kFaceRes=256, kMaxLights=32, kBlockW=768, kBlockH=512, kAtlasW=3072, kAtlasH=4096;
+// kFaceRes/kMaxLights/kBlockW/kBlockH/kAtlasW/kAtlasH are prepended at compile time from vsm:: (see MakeAtlasConstantsHLSL).
 int FaceFromDir(float3 v){ float3 a=abs(v); if(a.x>=a.y&&a.x>=a.z) return v.x>=0?0:1; if(a.y>=a.z) return v.y>=0?2:3; return v.z>=0?4:5; }
 float Lin(float d,float n,float f){ return n*f/max(f-d*(f-n),1e-4); }
 [numthreads(64,1,1)]
@@ -388,7 +417,8 @@ void VirtualShadowMaps::SetupResources()
 	if (SUCCEEDED(D3DCompile(kFullscreenVS, sizeof(kFullscreenVS) - 1, "FullscreenVS", nullptr, nullptr,
 	        "main", "vs_5_0", 0, 0, &fsBlob, &e2)))
 		device->CreateVertexShader(fsBlob->GetBufferPointer(), fsBlob->GetBufferSize(), nullptr, &fullscreenVS);
-	if (SUCCEEDED(D3DCompile(kLinearizePS, sizeof(kLinearizePS) - 1, "LinearizePS", nullptr, nullptr,
+	const std::string linearizeSrc = MakePreviewConstantsHLSL() + kLinearizePS;
+	if (SUCCEEDED(D3DCompile(linearizeSrc.data(), linearizeSrc.size(), "LinearizePS", nullptr, nullptr,
 	        "main", "ps_5_0", 0, 0, &psBlob, &e2)))
 		device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &linearizePS);
 
@@ -398,7 +428,7 @@ void VirtualShadowMaps::SetupResources()
 	device->CreateSamplerState(&samp, &pointSampler);
 
 	D3D11_BUFFER_DESC pcb{};
-	pcb.ByteWidth = 16;
+	pcb.ByteWidth = sizeof(PreviewCBData);
 	pcb.Usage = D3D11_USAGE_DYNAMIC;
 	pcb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 	pcb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -422,9 +452,9 @@ void VirtualShadowMaps::SetupResources()
 	}
 
 	// live debug tuning cbuffer (b13): bias / mode / vizScale / sampleSpace / matchThresh /
-	// compareMode / altEye (see UpdateDebugCB). 48 bytes = three float4 rows.
+	// compareMode / altEye (see UpdateDebugCB). VSMDebugCB = three float4 rows.
 	D3D11_BUFFER_DESC dcb{};
-	dcb.ByteWidth      = 48;
+	dcb.ByteWidth      = sizeof(VSMDebugCB);
 	dcb.Usage          = D3D11_USAGE_DYNAMIC;
 	dcb.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
 	dcb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -433,7 +463,8 @@ void VirtualShadowMaps::SetupResources()
 	// ---- GPU shadow-math probe resources (compute pass + in/out structured buffers) ----
 	{
 		ComPtr<ID3DBlob> csBlob, csErr;
-		HRESULT hrc = D3DCompile(kProbeCS, sizeof(kProbeCS) - 1, "ProbeCS", nullptr, nullptr,
+		const std::string probeSrc = MakeAtlasConstantsHLSL() + kProbeCS;
+		HRESULT hrc = D3DCompile(probeSrc.data(), probeSrc.size(), "ProbeCS", nullptr, nullptr,
 		    "main", "cs_5_0", 0, 0, &csBlob, &csErr);
 		if (FAILED(hrc)) {
 			logger::error("VSM: probe CS compile failed: {}",
@@ -489,7 +520,7 @@ void VirtualShadowMaps::SetupResources()
 		}
 	}
 
-	// ---- Real-shader pixel probe (u7): 1-element structured buffer the game's Lighting.hlsl writes,
+	// ---- Real-shader pixel probe (u8): 1-element structured buffer the game's Lighting.hlsl writes,
 	// bound by our OMSetRenderTargets hook only while armed; plus a staging copy for readback. ----
 	{
 		D3D11_BUFFER_DESC pb{};
@@ -648,8 +679,8 @@ void VirtualShadowMaps::UploadLightBuffer()
 	}
 }
 
-// Mirror the live tuning sliders into the shader's b13 cbuffer (must match VSM.hlsli's VSMDebug).
-// Layout is three float4 rows (48 bytes); scalar members are laid out to match the HLSL offsets.
+// Mirror the live tuning sliders into the shader's b13 cbuffer. Field order/types are fixed by
+// VSMDebugCB (which a static_assert pins to VSM.hlsli's VSMDebug layout).
 void VirtualShadowMaps::UpdateDebugCB()
 {
 	if (!debugCB)
@@ -660,23 +691,11 @@ void VirtualShadowMaps::UpdateDebugCB()
 	// (0,0,1) and mis-places the atlas. Space 2 samples with P + altEye for comparison.
 	const RE::NiPoint3 eye{ sceneCameraPos.x, sceneCameraPos.y, sceneCameraPos.z };
 
-	struct
-	{
-		float biasWorld;    // 0  shadow bias in world units (linear-distance compare)
-		int   mode;         // 4  0 shadow / 1 off / >=2 RGB diagnostics
-		float vizScale;     // 8  atlas-depth view scale
-		int   sampleSpace;  // 12 0 absP / 1 P / 2 P+altEye
-		float matchThresh;  // 16 light-match distance (world units)
-		int   compareMode;  // 20 0 linearized / 1 raw ndc.z
-		int   matchEye;     // 24 0 CameraPosAdjust / 1 altEye (posAdjust.getEye)
-		float dbgB;         // 28 spare
-		float altEyeX;      // 32 render eye (posAdjust)
-		float altEyeY;      // 36
-		float altEyeZ;      // 40
-		int   probeArmedCB; // 44 1 -> Lighting.hlsl writes the centre-pixel probe to u7
-	} cb{ dbgBiasWorld, dbgMode, dbgVizScale, dbgSampleSpace,
-	      dbgMatchThresh, dbgCompareMode, dbgMatchEye, 0.0f,
-	      eye.x, eye.y, eye.z, probeArmed ? 1 : 0 };
+	const VSMDebugCB cb{
+		dbgBiasWorld, dbgMode, dbgVizScale, dbgSampleSpace,   // row 0
+		dbgMatchThresh, dbgCompareMode, dbgMatchEye, 0.0f,    // row 1 (spare = 0)
+		eye.x, eye.y, eye.z, probeArmed ? 1 : 0,             // row 2 (probeArmed -> write pixel probe to u8)
+	};
 
 	D3D11_MAPPED_SUBRESOURCE m{};
 	if (SUCCEEDED(context->Map(debugCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -2080,10 +2099,10 @@ void VirtualShadowMaps::DumpDiagnosticLog()
 		if (SUCCEEDED(context->Map(pixelProbeStaging.Get(), 0, D3D11_MAP_READ, 0, &mp))) {
 			const auto& p = *static_cast<const PixelProbe*>(mp.pData);
 			if (p.pixel.z < 0.5f) {
-				logger::info("REAL-SHADER PROBE: armed but NOT written (written flag=0). Means the u7 UAV never reached");
+				logger::info("REAL-SHADER PROBE: armed but NOT written (written flag=0). Means the u8 UAV never reached");
 				logger::info("  Lighting.hlsl, OR the centre pixel is not lit by any point light. Aim the crosshair at a");
 				logger::info("  shadow band on a point-lit surface. If it stays 0 everywhere, the OMSetRenderTargets hook");
-				logger::info("  isn't binding u7 into the lighting pass (shader/hook mismatch).");
+				logger::info("  isn't binding u8 into the lighting pass (shader/hook mismatch).");
 			} else {
 				static const char* kReason[5] = { "eval(shadow computed)", "mode!=0", "no-match", "behind-light", "out-of-bounds" };
 				const int rz = (int)p.uv_occ.w; const int reason = (rz < 0 || rz > 4) ? 0 : rz;
@@ -2145,7 +2164,7 @@ void VirtualShadowMaps::DrawMenu()
 	}
 	ImGui::Checkbox("Arm real-shader pixel probe (crosshair)##VSM", &probeArmed);
 	ImGui::SameLine();
-	ImGui::TextDisabled(probeArmed ? "binds u7 during lighting; aim at the band, then Dump" : "off (default)");
+	ImGui::TextDisabled(probeArmed ? "binds u8 during lighting; aim at the band, then Dump" : "off (default)");
 
 	// ---- Live shadow tuning: updates the shader immediately via the b13 cbuffer, no rebuild ----
 	ImGui::Separator();

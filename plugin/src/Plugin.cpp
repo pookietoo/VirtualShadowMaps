@@ -40,7 +40,7 @@ namespace
 	PresentFn g_origPresent = nullptr;
 
 	// ---- ID3D11DeviceContext::OMSetRenderTargets hook (vtable index 33) — binds our pixel-probe UAV
-	// at u7 alongside whatever render targets a pass sets, ONLY while the probe is armed. This lets
+	// at u8 alongside whatever render targets a pass sets, ONLY while the probe is armed. This lets
 	// the real Lighting.hlsl write its per-pixel probe. When disarmed it's a pure passthrough. ----
 	using OMSetRTsFn     = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
 	using OMSetRTsUAVsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*, UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*);
@@ -75,7 +75,7 @@ namespace
 		g_origOMSetRTs = reinterpret_cast<OMSetRTsFn>(vtbl[33]);
 		vtbl[33] = reinterpret_cast<void*>(&HookedOMSetRenderTargets);
 		VirtualProtect(&vtbl[33], sizeof(void*), oldProtect, &oldProtect);
-		logger::info("VSM: OMSetRenderTargets hook installed (real-shader pixel probe, u7)");
+		logger::info("VSM: OMSetRenderTargets hook installed (real-shader pixel probe, u8)");
 	}
 
 	// Draw callback CS invokes inside its menu (registered via CS_RegisterExternalMenu).
@@ -187,7 +187,7 @@ extern "C" DLLEXPORT bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadInterface* a_s
 extern "C" DLLEXPORT constinit auto SKSEPlugin_Version = []() noexcept {
 	SKSE::PluginVersionData v;
 	v.PluginName(Plugin::NAME.data());
-	v.PluginVersion(REL::Version(0, 1, 0));
+	v.PluginVersion(REL::Version(Plugin::VERSION_MAJOR, Plugin::VERSION_MINOR, Plugin::VERSION_PATCH));
 	v.UsesAddressLibrary();
 	v.UsesNoStructs();
 	return v;

@@ -1,14 +1,20 @@
 #pragma once
 
 // ============================================================================
-// VirtualShadowMaps — standalone SKSE plugin (M0), owned entirely by us.
+// VirtualShadowMaps — standalone SKSE plugin, owned entirely by us.
 //
-// Renders our OWN depth map for one local shadow light from a minimal
-// scene-graph registry, driven by an IDXGISwapChain::Present hook. Its settings
-// UI (DrawMenu) is drawn INTO the Community Shaders menu via CS's add-on hook
-// (CS_RegisterExternalMenu / CS_GetImGui) — our logic never lives in CS's DLL;
-// CS only exposes a tiny generic hook, and our DLL shares CS's ImGui context.
+// Each frame (driven by an IDXGISwapChain::Present hook) it renders our OWN cube-shadow
+// atlas for every active local light — statics from a persistent scene-graph registry,
+// plus CPU-skinned characters (Path B) — and exposes the atlas + per-light buffer to
+// Community Shaders' LightLimitFix, whose Lighting.hlsl samples them (VSM.hlsli) so local
+// lights the engine's shadow budget dropped still cast shadows.
+//
+// The settings UI (DrawMenu) draws INTO the Community Shaders menu via CS's add-on hook
+// (CS_RegisterExternalMenu / CS_GetImGui) — our logic never lives in CS's DLL; CS only
+// exposes a tiny generic hook, and our DLL shares CS's ImGui context.
 // ============================================================================
+
+#include "VSMConstants.h"  // vsm:: atlas geometry + capacities (single source of truth)
 
 #include <DirectXMath.h>
 #include <d3d11.h>
@@ -42,8 +48,9 @@ public:
 	int  GetShadowLightCount() const { return static_cast<int>(lightRecords.size()); }
 	bool IsEnabled() const { return enabled; }
 
-	// Real-shader pixel probe: our OMSetRenderTargets hook (Plugin.cpp) binds this UAV at u7 during
+	// Real-shader pixel probe: our OMSetRenderTargets hook (Plugin.cpp) binds this UAV at u8 during
 	// the lighting draws ONLY while armed, so the real Lighting.hlsl can write its per-pixel state.
+	// (u8 because Lighting.hlsl's pixel shader already outputs render targets at u0..u7.)
 	ID3D11UnorderedAccessView* GetPixelProbeUAV() const { return pixelProbeUAV.Get(); }
 	bool IsProbeArmed() const { return probeArmed; }
 
@@ -135,7 +142,6 @@ private:
 
 	std::vector<CasterEntry> registry;             // persistent; rebuilt only when geometry streams in/out
 	std::unordered_set<RE::BSGeometry*> registrySeen;  // dedup across all capture sources this rebuild
-	static constexpr size_t  kMaxCasters        = 8192;  // hard cap so a huge cell can't runaway
 	// Capture-rejection tally (reset each rebuild): why a BSTriShape we reached was NOT registered.
 	int rejNoRD = 0, rejNoVB = 0, rejNoIB = 0, rejZeroTris = 0, rejDup = 0;
 	bool                     registryDirty      = true;
@@ -145,16 +151,8 @@ private:
 	ComPtr<ID3D11Buffer>             lightBuffer;    // GPU structured copy for the LLF shader
 	ComPtr<ID3D11ShaderResourceView> lightBufferSRV;
 
-	// Every active light = 6 cube faces = one 3x2 "block". Blocks tile the atlas in a grid.
-	// (Correctness-first: modest per-face res + a light cap; both scale up after the perf
-	// work in M2/M4.)
-	static constexpr int kFaceRes      = 256;
-	static constexpr int kMaxLights    = 32;
-	static constexpr int kLightsPerRow = 4;
-	static constexpr int kBlockW       = kFaceRes * 3;
-	static constexpr int kBlockH       = kFaceRes * 2;
-	static constexpr int kAtlasW       = kLightsPerRow * kBlockW;
-	static constexpr int kAtlasH       = ((kMaxLights + kLightsPerRow - 1) / kLightsPerRow) * kBlockH;
+	// Atlas geometry (kFaceRes/kMaxLights/kBlockW/kAtlasW/...) lives in VSMConstants.h so the
+	// C++ code, the generated preview/probe shaders, and VSM.hlsli all share one definition.
 
 	// settings (driven by DrawMenu)
 	bool  enabled      = false;
@@ -209,7 +207,7 @@ private:
 	// light.positionWS. Using our altEye (1) is 1 frame stale in the shader's b13 cbuffer, so on fast
 	// camera motion the match drifts past matchThresh and the shadow blinks off (flicker). 0 = robust.
 	int   dbgMatchEye    = 0;      // 0 = CameraPosAdjust (default, same-frame)  1 = altEye (stale)
-	bool  probeArmed     = false;  // menu: arm the real-shader pixel probe (writes centre pixel to u7)
+	bool  probeArmed     = false;  // menu: arm the real-shader pixel probe (writes centre pixel to u8)
 	ComPtr<ID3D11Buffer> debugCB;  // 48-byte cbuffer @ b13 (see UpdateDebugCB / VSM.hlsli::VSMDebug)
 
 	// GPU shadow-math PROBE. Runs the EXACT VSM sample logic on the GPU against the LIVE atlas +
@@ -225,7 +223,7 @@ private:
 	ComPtr<ID3D11Buffer>              probeOutStaging;
 	ComPtr<ID3D11Buffer>              probeCB;       // ProbeCB (b0)
 
-	// Real-shader pixel probe (u7): written by VSM.hlsli for the centre pixel when armed.
+	// Real-shader pixel probe (u8): written by VSM.hlsli for the centre pixel when armed.
 	ComPtr<ID3D11Buffer>              pixelProbeBuf;
 	ComPtr<ID3D11UnorderedAccessView> pixelProbeUAV;
 	ComPtr<ID3D11Buffer>              pixelProbeStaging;

@@ -6,4 +6,10 @@ namespace Plugin
 
 	inline constexpr auto NAME = "@PROJECT_NAME@"sv;
 	inline constexpr auto VERSION = "@PROJECT_VERSION@"sv;
+
+	// Numeric parts of the SKSE plugin version, so SKSEPlugin_Version derives from the single
+	// CMake project(VERSION ...) source instead of a hand-kept REL::Version literal.
+	inline constexpr int VERSION_MAJOR = @PROJECT_VERSION_MAJOR@;
+	inline constexpr int VERSION_MINOR = @PROJECT_VERSION_MINOR@;
+	inline constexpr int VERSION_PATCH = @PROJECT_VERSION_PATCH@;
 }
