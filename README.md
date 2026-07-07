@@ -41,8 +41,7 @@ Each frame, on an `IDXGISwapChain::Present` hook, the plugin:
 4. Exposes the atlas + a per-light structured buffer + sampler to Community Shaders' Light Limit
    Fix, which samples them in `Shaders/VirtualShadowMaps/VSM.hlsli`.
 
-Coordinate space is world-absolute throughout (matching how CS treats `ShadowSceneNode` positions);
-see `DESIGN.md` for the full as-built design.
+Coordinate space is world-absolute throughout (matching how CS treats `ShadowSceneNode` positions).
 
 ## Repository layout
 
@@ -55,7 +54,6 @@ plugin/src/
   VSMConfig.{h,cpp}                  TOML config + settings persistence
   Plugin.cpp                         SKSE entry points + the Present / OMSetRenderTargets hooks
 Shaders/                             CS shader overrides — VSM.hlsli (ours) + CS-derived edits (see License)
-DESIGN.md, VSM_PHASE_*.md            design + roadmap notes
 ```
 
 `extern/` (CommonLibSSE-NG, vcpkg), `community-shaders/`, and the built `dist/` mod folder are not
@@ -109,7 +107,7 @@ is likewise GPL-3.0. Community Shaders itself is by doodlum and contributors.
 
 Issues, ideas, and pull requests are welcome — especially on the open interior "shadow shift"
 behavior and head/hair rendering. If you just want to run it, grab a release; if you want to hack on
-it, `DESIGN.md` and the `VSM_PHASE_*` notes are the map.
+it, the plugin source and its comments are the place to start.
 
 ## Credits
 

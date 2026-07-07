@@ -18,6 +18,9 @@ screenshots/
 # ---- Logs (runtime + transient build logs) ----
 *.log
 
+# ---- Local design/roadmap notes (kept locally, not part of the shipped project) ----
+notes/
+
 # ---- Holding area for removed code (user empties this) ----
 trash/
 
