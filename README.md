@@ -9,9 +9,6 @@ to [Community Shaders](https://github.com/doodlum/skyrim-community-shaders)' Lig
 `Lighting.hlsl` samples our shadows. The plugin owns all of its logic — Community Shaders only
 exposes a tiny generic menu hook, so nothing of ours lives in CS's DLL.
 
-> This is a work in progress, shared openly. I just want good shadows in Skyrim — if someone else
-> takes it further or does it all, that's a win. Contributions and forks welcome.
-
 ## Status
 
 Verified working in-game (build 0.9.35):
@@ -105,9 +102,7 @@ is likewise GPL-3.0. Community Shaders itself is by doodlum and contributors.
 
 ## Contributing
 
-Issues, ideas, and pull requests are welcome — especially on the open interior "shadow shift"
-behavior and head/hair rendering. If you just want to run it, grab a release; if you want to hack on
-it, the plugin source and its comments are the place to start.
+Issues, ideas, and pull requests are welcome.
 
 ## Credits
 
