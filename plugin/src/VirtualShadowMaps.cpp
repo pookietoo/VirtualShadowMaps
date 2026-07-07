@@ -1,5 +1,6 @@
 #include "VirtualShadowMaps.h"
 #include "VSMInternal.h"  // shared helpers: NiTransformToXM, GraphicsStateGuard, probe structs, kBuildTag, kReverseZ
+#include "VSMConfig.h"    // persisted runtime tunables (VirtualShadowMaps.toml)
 
 #include <imgui.h>  // shared with CS's context via the add-on hook
 
@@ -203,7 +204,38 @@ void VirtualShadowMaps::OnD3DReady(ID3D11Device* a_device, ID3D11DeviceContext* 
 {
 	device = a_device;
 	context = a_context;
+	LoadConfig();       // apply persisted tunables before the first frame
 	SetupResources();
+}
+
+// Pull the persisted defaults from VirtualShadowMaps.toml into the live settings at startup.
+void VirtualShadowMaps::LoadConfig()
+{
+	auto& cfg = vsm::GetConfig();
+	cfg.Load();
+	enabled         = cfg.enabled;
+	frustumCull     = cfg.frustumCull;
+	shadowFarScale  = cfg.farScale;
+	shadowNearFrac  = cfg.nearFrac;
+	shadowBiasWorld = cfg.bias;
+	dbgMatchThresh  = cfg.matchThreshold;
+}
+
+// When a persisted tuning control changed and the user has released it (nothing active), mirror
+// the live settings back into the config and write the file. Called at the end of DrawMenu.
+void VirtualShadowMaps::PersistSettingsIfChanged()
+{
+	if (!settingsDirty || ImGui::IsAnyItemActive())
+		return;
+	auto& cfg = vsm::GetConfig();
+	cfg.enabled        = enabled;
+	cfg.frustumCull    = frustumCull;
+	cfg.farScale       = shadowFarScale;
+	cfg.nearFrac       = shadowNearFrac;
+	cfg.bias           = shadowBiasWorld;
+	cfg.matchThreshold = dbgMatchThresh;
+	cfg.Save();
+	settingsDirty = false;
 }
 
 void VirtualShadowMaps::SetupResources()
@@ -998,10 +1030,10 @@ void VirtualShadowMaps::DrawMenu()
 	}
 
 	ImGui::TextDisabled("build %s", kBuildTag);
-	ImGui::Checkbox("Enabled##VSM", &enabled);
+	settingsDirty |= ImGui::Checkbox("Enabled##VSM", &enabled);
 	ImGui::SameLine();
 	ImGui::TextDisabled("light: %s | casters: %d/%d", haveTestLight ? "yes" : "no", visibleCasters, (int)registry.size());
-	ImGui::Checkbox("Frustum cull##VSM", &frustumCull);
+	settingsDirty |= ImGui::Checkbox("Frustum cull##VSM", &frustumCull);
 	ImGui::SameLine();
 	ImGui::Checkbox("Casters absolute (+cam)##VSM", &dbgCastersAbsolute);
 
@@ -1069,14 +1101,17 @@ void VirtualShadowMaps::DrawMenu()
 	                   "7/10 green near lights, 16 green near lights, 18 BLACK. Flip to space 1 to see the "
 	                   "old broken behavior for comparison.");
 	ImGui::Text("far = radius x FarScale ; near = far x NearFrac ; shadow if pixel-occluder > Bias");
-	ImGui::SliderFloat("FarScale (x radius)##VSM", &shadowFarScale, 0.25f, 4.0f, "%.2f");
-	ImGui::SliderFloat("NearFrac (x far)##VSM", &shadowNearFrac, 0.001f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic);
-	ImGui::SliderFloat("Bias (world units)##VSM", &shadowBiasWorld, 0.0f, 50.0f, "%.1f");
-	ImGui::SliderFloat("Match threshold (world units)##VSM", &dbgMatchThresh, 0.5f, 200.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+	settingsDirty |= ImGui::SliderFloat("FarScale (x radius)##VSM", &shadowFarScale, 0.25f, 4.0f, "%.2f");
+	settingsDirty |= ImGui::SliderFloat("NearFrac (x far)##VSM", &shadowNearFrac, 0.001f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic);
+	settingsDirty |= ImGui::SliderFloat("Bias (world units)##VSM", &shadowBiasWorld, 0.0f, 50.0f, "%.1f");
+	settingsDirty |= ImGui::SliderFloat("Match threshold (world units)##VSM", &dbgMatchThresh, 0.5f, 200.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
 	ImGui::SliderFloat("Depth-view scale (debug)##VSM", &dbgVizScale, 100.0f, 8192.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
 	ImGui::Separator();
 
-	// Everything below is a temporary M0 validation view. When this section is closed,
+	// Persist any changed tuning to VirtualShadowMaps.toml once the control is released.
+	PersistSettingsIfChanged();
+
+	// Everything below is a debug/validation view. When this section is closed,
 	// RenderFrame does no debug-only GPU work at all.
 	showDebug = ImGui::CollapsingHeader("Debug / test view##VSM");
 	if (!showDebug)

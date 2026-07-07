@@ -79,6 +79,8 @@ private:
 	void DumpSceneCensus(RE::NiAVObject* a_root, const char* a_label);  // SEH-guarded scene-graph census
 	void DumpPlayerDiag(RE::NiAVObject* a_p3d);                          // player geometry + registry membership
 	void PlayerWalk(RE::NiAVObject* a_o, int a_depth, int& a_tris, int& a_inReg, int& a_other);  // recursive helper
+	void LoadConfig();                 // pull persisted tunables from VirtualShadowMaps.toml at startup
+	void PersistSettingsIfChanged();   // write tuning changes back to the config file (once, on control release)
 
 	// A caster references its live geometry via NiPointer (so it can't be freed under us).
 	// Buffers, world transform and bound are re-read from `geom` every frame — this keeps
@@ -154,9 +156,10 @@ private:
 	// Atlas geometry (kFaceRes/kMaxLights/kBlockW/kAtlasW/...) lives in VSMConstants.h so the
 	// C++ code, the generated preview/probe shaders, and VSM.hlsli all share one definition.
 
-	// settings (driven by DrawMenu)
-	bool  enabled      = false;
-	bool  frustumCull  = true;    // cull casters to the light frustum (leaf-level)
+	// settings (driven by DrawMenu; persisted defaults loaded from VirtualShadowMaps.toml — see VSMConfig)
+	bool  enabled       = false;
+	bool  frustumCull   = true;    // cull casters to the light frustum (leaf-level)
+	bool  settingsDirty = false;   // a persisted tuning control changed this frame -> save on release
 	// Do NOT offset casters: geom->world.translate under the ShadowSceneNode is ALREADY game-absolute
 	// (confirmed vs CS: LightLimitFix passes niLight->world.translate as the absolute light pos and
 	// SUBTRACTS the eye to get camera-relative positionWS). Adding cameraPos (the old =true default)
