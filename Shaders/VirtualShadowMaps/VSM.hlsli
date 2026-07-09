@@ -7,10 +7,10 @@
 // VirtualShadowMaps.cpp::BuildCubeMatrices. This file ships with CS but is our logic.
 namespace VSM
 {
-	static const int kMaxLights = 32;  // light-buffer capacity (matches ShadowLights[] size). Atlas DIMENSIONS
-	                                   // are RUNTIME (gFaceRes/gAtlasW/gAtlasH, b13 cbuffer) from iShadowMapResolution
-	                                   // — never hard-code them here; the old compile-time kFaceRes/kBlockW/kAtlasW/
-	                                   // kAtlasH were removed after they mis-sampled the atlas at res != 256.
+	// The ShadowLights buffer is DYNAMIC (grows with the active shadow-light count — there is NO fixed cap).
+	// The light loops below get the real element count from ShadowLights.GetDimensions(), never a compile-time
+	// size. Atlas DIMENSIONS are RUNTIME too (gAtlasW/gAtlasH, b13 cbuffer) from iShadowMapResolution — never
+	// hard-code them here; the old compile-time kFaceRes/kBlockW/kAtlasW/kAtlasH mis-sampled the atlas at res != 256.
 
 	// Named tunable/sentinel constants (rename+document only — values are the historical magic numbers,
 	// unchanged). Namespace scope so every function below shares one definition.
@@ -20,14 +20,16 @@ namespace VSM
 	static const float kOutOfCubeNdc = 9.0;  // ndc sentinel value meaning "no valid projection" (out of cube / behind)
 	static const float kDivEps      = 1e-4;  // near-zero divide / behind-light guard
 	static const float kArgMinInit  = 1e30;  // initial best-distance for the nearest-light argmin
+	static const int   kMaxPCFRadius = 4;    // clamp cap for the runtime soft-shadow PCF half-width (gPCFRadius, from
+	                                         // iBlurDeferredShadowMask). Fixed texels x per-light faceRes = constant screen penumbra.
 
 	struct LightRecord
 	{
-		float4             positionWS;  // xyz = light pos (float4 -> cubeVP lands at byte 32, matches C++)
+		float4             positionWS;  // xyz = light pos; w = per-light cube-face resolution (faceRes, texels)
 		float              farPlane;
 		float              nearPlane;
-		uint               atlasCol;
-		uint               atlasRow;
+		float              atlasX;      // pixel origin X of this light's 3x2 cube-face block in the atlas
+		float              atlasY;      // pixel origin Y (cubeVP still lands at byte 32 — layout unchanged)
 		row_major float4x4 cubeVP[6];
 	};
 
@@ -39,7 +41,7 @@ namespace VSM
 	// LightLimitFix::Prepass. 64-byte layout = four float4 rows; MUST match the C++ struct (static_assert).
 	cbuffer VSMDebug : register(b13)
 	{
-		float gBiasWorld;    // 0  LEGACY world-space shadow bias — read ONLY by debug mode 15; the real shadow path
+		float gBiasScale;    // 0  fShadowBiasScale: multiplier on the CALCULATED per-pixel bias (default 1; <0 = everything shadowed). Was gBiasWorld
 		                     //    uses a CALCULATED receiver-plane bias (see GetLocalShadow), not this slider
 		int   gMode;         // 4  debug view selector (see mode legend below the cbuffer): 0 = real shadow,
 		                     //    1 = off(lit), 2..22 = RGB diagnostic overlay, 23/24/25 = shadow-tint (not overlays)
@@ -49,7 +51,7 @@ namespace VSM
 		                     //    only debug mode 16 still reads it
 		int   gCompareMode;  // 20 0 = linearized-distance compare  1 = raw ndc.z compare
 		int   gMatchEye;     // 24 0 = CameraPosAdjust  1 = altEye(posAdjust.getEye) — eye for lightPosWS match
-		float gFaceRes;      // 28 RUNTIME per-cube-face resolution (from iShadowMapResolution); block=3x2 faces
+		float gPCFRadius;    // 28 soft-shadow PCF kernel half-width in texels (from iBlurDeferredShadowMask; 0 = hard). Was gFaceRes (now per-light in positionWS.w)
 		float gAltEyeX;      // 32 render eye the atlas was rasterized around (posAdjust)
 		float gAltEyeY;      // 36
 		float gAltEyeZ;      // 40
@@ -198,7 +200,8 @@ namespace VSM
 			// lower-indexed light steal a pixel when two lights fell within the threshold -> wrong cube ->
 			// arbitrary occluder -> spurious cross-room shadow. gMatchThresh is no longer needed.
 			int best = -1; float bestD = kArgMinInit;
-			[loop] for (uint i = 0; i < (uint)kMaxLights; ++i) {
+			uint lightCount, lightStride; ShadowLights.GetDimensions(lightCount, lightStride);  // runtime buffer size (grows with active lights; NO cap)
+			[loop] for (uint i = 0; i < lightCount; ++i) {
 				float3 rp = ShadowLights[i].positionWS.xyz;
 				if (dot(rp, rp) < kEmptySlotMin) continue;
 				float dl = distance(rp, absLight);
@@ -223,11 +226,11 @@ namespace VSM
 						inb = 1;
 						// RUNTIME atlas dims (from the b13 cbuffer) so sampling matches the texture the plugin
 						// actually allocated this frame (sized for the active lights, at iShadowMapResolution).
-						float faceRes = gFaceRes, blockW = faceRes * 3.0, blockH = faceRes * 2.0;  // 3x2 cube-face block
+						float faceRes = L.positionWS.w;  // per-light cube-face resolution (was global gFaceRes)
 						float2 faceUV = ndc.xy * float2(0.5, -0.5) + 0.5;
 						faceUV = clamp(faceUV, 0.5 / faceRes, 1.0 - 0.5 / faceRes);  // never floor into a neighbour tile
 						float2 tile   = float2(face % 3, face / 3);
-						float2 pxc    = float2(L.atlasCol * blockW, L.atlasRow * blockH) + (tile + faceUV) * faceRes;
+						float2 pxc    = float2(L.atlasX, L.atlasY) + (tile + faceUV) * faceRes;  // atlasX/Y = block pixel origin
 						atlasUV       = pxc / float2(gAtlasW, gAtlasH);
 						occluder      = ShadowAtlas.SampleLevel(ShadowSampler, atlasUV, 0);
 						if (gCompareMode == 1) {
@@ -247,8 +250,23 @@ namespace VSM
 							float  ndl       = max(dot(worldNormal, Ldir), kNdotLFloor);
 							float  slope     = sqrt(saturate(1.0 - ndl * ndl)) / ndl;  // tan(incidence) from the G-buffer normal
 							float  footprint = linPix * (2.0 / faceRes);               // texel lateral size at this distance
-							float  bias      = 2.0 * footprint * slope;                // x2 = texel diagonal + point-sample jitter
-							shadow = (linPix - linOcc > bias) ? 0.0 : 1.0;
+							float  bias      = 2.0 * footprint * slope * gBiasScale;   // x2 = texel diagonal + jitter; gBiasScale = fShadowBiasScale
+							// SOFT SHADOWS (PCF): average the depth compare over a RUNTIME texel kernel (half-width
+							// gPCFRadius from iBlurDeferredShadowMask; 0 = hard). A fixed texel radius x this light's
+							// variable faceRes rung => ~constant SCREEN-space penumbra across lights (the coupling in
+							// notes/VSM_VARIABLE_RESOLUTION.md). Each tap is clamped inside this face (no neighbour bleed).
+							int    pr  = clamp((int)gPCFRadius, 0, kMaxPCFRadius);
+							float  sum = 0.0, cnt = 0.0;
+							[loop] for (int oy = -pr; oy <= pr; ++oy)
+								[loop] for (int ox = -pr; ox <= pr; ++ox) {
+									float2 fuv  = clamp(faceUV + float2(ox, oy) / faceRes, 0.5 / faceRes, 1.0 - 0.5 / faceRes);
+									float2 tpx  = float2(L.atlasX, L.atlasY) + (tile + fuv) * faceRes;
+									float  occT = ShadowAtlas.SampleLevel(ShadowSampler, tpx / float2(gAtlasW, gAtlasH), 0);
+									float  loT  = LinearizeCubeDepth(occT, L.nearPlane, L.farPlane);
+									sum += (linPix - loT > bias) ? 0.0 : 1.0;
+									cnt += 1.0;
+								}
+							shadow = sum / cnt;  // 0=shadowed .. 1=lit (fractional=penumbra); pr=0 -> single tap (hard)
 						}
 						// Tint modes: record what shadowed this pixel so Lighting.hlsl can paint it.
 						if ((gMode == 23 || gMode == 24 || gMode == 25) && shadow < 0.5) {
@@ -337,7 +355,8 @@ namespace VSM
 		// Nearest valid buffer light to this pixel, measured in the SAME space we project in.
 		int   best  = -1;
 		float bestD = kArgMinInit;
-		[loop] for (uint i = 0; i < (uint)kMaxLights; ++i) {
+		uint lightCount, lightStride; ShadowLights.GetDimensions(lightCount, lightStride);  // runtime buffer size (NO cap)
+		[loop] for (uint i = 0; i < lightCount; ++i) {
 			float3 rp = ShadowLights[i].positionWS.xyz;
 			if (dot(rp, rp) < kEmptySlotMin)
 				continue;
@@ -367,8 +386,8 @@ namespace VSM
 		float2 tile     = float2(face % 3, face / 3);
 		// RUNTIME atlas dims (b13 cbuffer), matching the real GetLocalShadow path — NOT the compile-time
 		// kBlockW/kFaceRes/kAtlasW/kAtlasH, which are wrong once iShadowMapResolution != 256.
-		float  faceRes  = gFaceRes;
-		float2 px       = float2(L.atlasCol * faceRes * 3.0, L.atlasRow * faceRes * 2.0) + (tile + faceUV) * faceRes;  // 3x2 cube-face block
+		float  faceRes  = L.positionWS.w;  // per-light cube-face resolution (was global gFaceRes)
+		float2 px       = float2(L.atlasX, L.atlasY) + (tile + faceUV) * faceRes;  // atlasX/Y = block pixel origin
 		float2 atlasUV  = px / float2(gAtlasW, gAtlasH);
 		float  occluder = ShadowAtlas.SampleLevel(ShadowSampler, atlasUV, 0);
 		float  linPix   = LinearizeCubeDepth(saturate(ndc.z), L.nearPlane, L.farPlane);
@@ -386,7 +405,7 @@ namespace VSM
 		if (gMode == 12) return saturate(occluder).xxx;                             // RAW atlas depth we read (occluder)
 		if (gMode == 13) return saturate(linOcc / gVizScale).xxx;                   // occluder distance
 		if (gMode == 14) return saturate(linPix / gVizScale).xxx;                   // pixel distance from the light
-		if (gMode == 15) return (linPix - linOcc > gBiasWorld) ? float3(1,0,0) : float3(0,1,0);  // LEGACY gBiasWorld decision (NOT the calculated-bias path); red=shadow
+		if (gMode == 15) return (linPix - linOcc > gBiasScale) ? float3(1,0,0) : float3(0,1,0);  // legacy rough decision vs gBiasScale (NOT the calculated-bias path); red=shadow
 		if (gMode == 16) return bestD < gMatchThresh ? float3(0,1,0) : float3(1, saturate(bestD / 500.0), 0);  // LEGACY (gMatchThresh unused by the real nearest-light match); green=matched
 		if (gMode == 17) return frac(float3(best * 0.1237, best * 0.3391, best * 0.5541) + 0.11);      // matched light index color
 		if (gMode == 19) return (occluder > 0.0001) ? float3(0,1,0) : float3(0.2,0,0);  // atlas populated where we sample? reverse-Z: green=depth>0 (empty=0)

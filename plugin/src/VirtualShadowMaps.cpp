@@ -116,8 +116,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	// reads garbage. Populated by UpdateDebugCB, sized via sizeof here and in SetupResources.
 	struct alignas(16) VSMDebugCB
 	{
-		float biasWorld;   int mode;        float vizScale;  int sampleSpace;  // row 0
-		float matchThresh; int compareMode; int matchEye;    float faceRes;    // row 1 (spare -> runtime faceRes)
+		float biasScale;   int mode;        float vizScale;  int sampleSpace;  // row 0 (biasScale = fShadowBiasScale x calc bias)
+		float matchThresh; int compareMode; int matchEye;    float pcfRadius;  // row 1 (pcfRadius = PCF half-width, from iBlurDeferredShadowMask)
 		float altEyeX;     float altEyeY;   float altEyeZ;   int probeArmed;   // row 2
 		float probePixelX; float probePixelY; float atlasH;  float atlasW;     // row 3 (ppad0/ppad1 -> runtime atlasH/atlasW)
 	};
@@ -211,45 +211,75 @@ void VirtualShadowMaps::ComputeAtlasDims()
 	if (auto* col = RE::INIPrefSettingCollection::GetSingleton())
 		if (auto* s = col->GetSetting("iShadowMapResolution:Display"))
 			ini = s->data.i;   // 'i' prefix = signed-int setting
-	// Per-cube-face resolution = the game's shadow-quality ini, full value (no VRAM cap). The atlas is NOT
-	// pre-sized for kMaxLights; EnsureAtlas sizes it for the lights actually active, so VRAM = faceRes x
-	// (active lights) — you pay for what's on, not for 32. (256 fallback; clamp is sanity, not a bound.)
-	int fr = (ini >= 256) ? ini : kFaceRes;
-	if (fr < 256) fr = 256;
+	// The user's iShadowMapResolution is the TOP rung of the per-light resolution ladder (its exact value,
+	// may be non-pow2). The floor rung = min(kFloorFaceRes, max). Per-light faceRes is chosen each frame
+	// between these bounds by AssignFaceRes; this only sets the BOUNDS + the packer/diagnostics reference.
+	int fr = (ini >= vsm::kFloorFaceRes) ? ini : kFaceRes;
+	if (fr < vsm::kFloorFaceRes) fr = vsm::kFloorFaceRes;
 	if (fr > 8192) fr = 8192;
-	rtFaceRes = fr;
-	rtBlockW  = fr * 3;
-	rtBlockH  = fr * 2;
-	rtAtlasW  = rtBlockW;   // provisional: 1 light; EnsureAtlas grows to the active-light count
-	rtAtlasH  = rtBlockH;
-	VSM_LOG("VSM: iShadowMapResolution={} -> per-cube-face {} (block {}x{}); atlas sized per ACTIVE light count (no cap)",
-	    ini, rtFaceRes, rtBlockW, rtBlockH);
+	rtMaxFaceRes   = fr;
+	rtFloorFaceRes = (std::min)(static_cast<int>(vsm::kFloorFaceRes), rtMaxFaceRes);
+	rtFaceRes = rtMaxFaceRes;      // reference = the MAX rung (packer target-width unit + diagnostics)
+	rtBlockW  = rtMaxFaceRes * 3;  // a MAX-size light block (3x2 faces)
+	rtBlockH  = rtMaxFaceRes * 2;
+	rtAtlasW  = rtFloorFaceRes * 3;  // seed: one floor block; PackAtlas grows the atlas to fit the active lights
+	rtAtlasH  = rtFloorFaceRes * 2;
+	// Honor the user's other SkyrimPrefs shadow keys — we ARE the local shadow system now, so preserve intent.
+	if (auto* col = RE::INIPrefSettingCollection::GetSingleton()) {
+		if (auto* s = col->GetSetting("fShadowBiasScale:Display"))        rtBiasScale      = s->data.f;  // may be <0 (STEP: everything shadowed)
+		if (auto* s = col->GetSetting("iBlurDeferredShadowMask:Display")) rtPCFRadius      = std::clamp(s->data.i, 0, vsm::kMaxPCFRadius);
+		if (auto* s = col->GetSetting("fShadowDistance:Display"))         rtShadowDistance = s->data.f;
+	}
+	VSM_LOG("VSM: iShadowMapResolution={} -> face ladder floor {} .. max {}; fShadowBiasScale={:.2f} iBlurDeferredShadowMask->PCF={} fShadowDistance={:.0f}",
+	    ini, rtFloorFaceRes, rtMaxFaceRes, rtBiasScale, rtPCFRadius, rtShadowDistance);
 }
 
-// Grow the atlas to fit the ACTIVE shadow-light count (grow-only, so a busy frame doesn't thrash a shrink).
-// Called each frame after CollectLights. VRAM = faceRes x active-light blocks — you pay for lights that are
-// on, never for kMaxLights. CS re-fetches GetAtlasSRV() each Prepass, so recreating the texture is safe.
-void VirtualShadowMaps::EnsureAtlas(int nLights)
+// (Re)create the per-light structured buffer + SRV at `cap` elements. Called once at setup and by
+// EnsureLightBuffer when the active-light count outgrows the current capacity (grow-only). CS re-fetches
+// GetLightBufferSRV() each Prepass, so replacing the buffer/SRV mid-session is safe (same as the atlas).
+bool VirtualShadowMaps::CreateLightBufferResources(int cap)
 {
-	if (nLights < 1) nLights = 1;
-	const int cols  = (nLights < kLightsPerRow) ? nLights : kLightsPerRow;
-	const int rows  = (nLights + kLightsPerRow - 1) / kLightsPerRow;
-	const int needW = cols * rtBlockW;
-	const int needH = rows * rtBlockH;
-	if (depthTex && needW <= rtAtlasW && needH <= rtAtlasH)
-		return;                                   // current atlas already fits
-	rtAtlasW = (needW > rtAtlasW) ? needW : rtAtlasW;
-	rtAtlasH = (needH > rtAtlasH) ? needH : rtAtlasH;
-	if (!CreateAtlasResources())
-		logger::error("VSM: atlas grow to {}x{} for {} lights FAILED (out of VRAM?)", rtAtlasW, rtAtlasH, nLights);
+	if (!device || cap < 1) return false;
+	lightBuffer.Reset();
+	lightBufferSRV.Reset();
+	D3D11_BUFFER_DESC lb{};
+	lb.ByteWidth           = static_cast<UINT>(sizeof(LightRecord)) * static_cast<UINT>(cap);
+	lb.Usage               = D3D11_USAGE_DYNAMIC;
+	lb.BindFlags           = D3D11_BIND_SHADER_RESOURCE;
+	lb.CPUAccessFlags      = D3D11_CPU_ACCESS_WRITE;
+	lb.MiscFlags           = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+	lb.StructureByteStride = sizeof(LightRecord);
+	if (FAILED(device->CreateBuffer(&lb, nullptr, &lightBuffer))) {
+		logger::error("VSM: light buffer creation failed (cap {})", cap);
+		return false;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+	sd.Format              = DXGI_FORMAT_UNKNOWN;
+	sd.ViewDimension       = D3D11_SRV_DIMENSION_BUFFER;
+	sd.Buffer.FirstElement = 0;
+	sd.Buffer.NumElements  = static_cast<UINT>(cap);
+	device->CreateShaderResourceView(lightBuffer.Get(), &sd, &lightBufferSRV);
+	lightBufCapacity = cap;
+	return true;
+}
+
+// Grow the per-light buffer to hold at least nLights (grow-only, geometric doubling). Called each frame
+// after CollectLights, before UploadLightBuffer. NO cap on lights: the buffer is tiny (sizeof(LightRecord)
+// per light) so the real cost is the atlas VRAM, which per-light variable resolution keeps in check.
+void VirtualShadowMaps::EnsureLightBuffer(int nLights)
+{
+	if (nLights <= lightBufCapacity) return;
+	int cap = lightBufCapacity > 0 ? lightBufCapacity : 1;
+	while (cap < nLights) cap *= 2;
+	if (!CreateLightBufferResources(cap))
+		logger::error("VSM: light buffer grow to {} for {} lights FAILED", cap, nLights);
 	else
-		VSM_LOG("VSM: atlas grown to {}x{} (~{}MB) for {} active lights @ faceRes {}", rtAtlasW, rtAtlasH,
-		    (static_cast<std::int64_t>(rtAtlasW) * rtAtlasH * static_cast<std::int64_t>(sizeof(float))) / kBytesPerMB,  // R32 depth: sizeof(float) bytes/texel
-		    nLights, rtFaceRes);
+		VSM_LOG("VSM: light buffer grown to {} elements (~{}KB) for {} active shadow lights", cap,
+		    (static_cast<std::int64_t>(cap) * static_cast<std::int64_t>(sizeof(LightRecord))) / 1024, nLights);
 }
 
 // (Re)create the atlas + id-atlas textures and their views at rtAtlasW x rtAtlasH. Called by SetupResources
-// and by EnsureAtlas when the active-light count needs a bigger atlas. Returns false on allocation failure.
+// and by PackAtlas when the packed active-light blocks need a bigger atlas. Returns false on allocation failure.
 bool VirtualShadowMaps::CreateAtlasResources()
 {
 	if (!device) return false;
@@ -307,7 +337,7 @@ void VirtualShadowMaps::SetupResources()
 	if (!device)
 		return;
 	ComputeAtlasDims();                       // faceRes from iShadowMapResolution (no cap)
-	if (!CreateAtlasResources()) {            // atlas sized for 1 light initially; EnsureAtlas grows it
+	if (!CreateAtlasResources()) {            // atlas seeded at one floor block; PackAtlas grows it to fit the active lights
 		logger::error("VSM: initial atlas creation failed");
 		return;
 	}
@@ -404,22 +434,9 @@ void VirtualShadowMaps::SetupResources()
 	pcb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 	device->CreateBuffer(&pcb, nullptr, &previewCB);
 
-	// per-light structured buffer (mirrors lightRecords) for the LLF shader
-	D3D11_BUFFER_DESC lb{};
-	lb.ByteWidth = sizeof(LightRecord) * kMaxLights;
-	lb.Usage = D3D11_USAGE_DYNAMIC;
-	lb.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-	lb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-	lb.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-	lb.StructureByteStride = sizeof(LightRecord);
-	if (SUCCEEDED(device->CreateBuffer(&lb, nullptr, &lightBuffer))) {
-		D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-		sd.Format = DXGI_FORMAT_UNKNOWN;
-		sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-		sd.Buffer.FirstElement = 0;
-		sd.Buffer.NumElements = kMaxLights;
-		device->CreateShaderResourceView(lightBuffer.Get(), &sd, &lightBufferSRV);
-	}
+	// per-light structured buffer (mirrors lightRecords) for the LLF shader. Sized for kMaxLights INITIALLY,
+	// but EnsureLightBuffer grows it on demand each frame — there is NO hard cap on shadow-casting lights.
+	CreateLightBufferResources(kMaxLights);
 
 	// live debug tuning cbuffer (b13): bias / mode / vizScale / sampleSpace / matchThresh /
 	// compareMode / altEye (see UpdateDebugCB). VSMDebugCB = four float4 rows.
@@ -461,6 +478,85 @@ void VirtualShadowMaps::SetupResources()
 
 	resourcesReady = true;
 	VSM_LOG("VSM: resources ready ({}x{} shadow atlas + linear preview)", rtAtlasW, rtAtlasH);
+}
+
+// Snap a desired face resolution UP to the pow2 ladder [floor .. max]. The TOP rung is the EXACT max (the
+// user's iShadowMapResolution, may be non-pow2); every rung below is a power of two. Round the top DOWN
+// below max (never exceed the user's budget): if `desired` lands above the largest pow2 <= max but below
+// max, use max. See notes/VSM_VARIABLE_RESOLUTION.md.
+static int SnapFaceResToLadder(int a_desired, int a_floorRes, int a_maxRes)
+{
+	if (a_maxRes <= a_floorRes) return a_maxRes;      // degenerate: single rung = max
+	if (a_desired <= a_floorRes) return a_floorRes;
+	if (a_desired >= a_maxRes)   return a_maxRes;
+	int r = a_floorRes;
+	while (r < a_desired) {
+		const int next = r * 2;
+		if (next > a_maxRes) return a_maxRes;         // no pow2 rung >= desired fits under max -> top rung = max
+		r = next;
+	}
+	return r;                                          // smallest pow2 rung >= desired, still <= max
+}
+
+// Pick a light's cube-face resolution rung from its ON-SCREEN size (angular metric radius/dist), snapped
+// UP to the ladder, with hysteresis: hold the previous rung until the desired resolution moves more than
+// kLevelHysteresis, so the level doesn't flicker at a boundary as the camera moves.
+int VirtualShadowMaps::AssignFaceRes(float a_radius, const RE::NiPoint3& a_lightPos, const RE::NiPoint3& a_camPos, const void* a_lightId)
+{
+	const float dx = a_lightPos.x - a_camPos.x, dy = a_lightPos.y - a_camPos.y, dz = a_lightPos.z - a_camPos.z;
+	float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+	if (dist < 1.0f) dist = 1.0f;
+	// Projected shadow diameter in screen pixels ~ (radius/dist) * (screenH / tanHalfFov); aim for ~k shadow
+	// texels per screen pixel -> desiredFaceRes = k * that. k, tanHalfFov are approximate; the ladder snap
+	// + hysteresis absorb the imprecision.
+	const float desiredF = vsm::GetConfig().qualityFactor * (a_radius / dist) * (screenH / vsm::kTanHalfFovV);
+	const int   desired  = (desiredF < 1.0f) ? 1 : static_cast<int>(desiredF);
+	int level = SnapFaceResToLadder(desired, rtFloorFaceRes, rtMaxFaceRes);
+	if (const auto it = prevLightFaceRes.find(a_lightId); it != prevLightFaceRes.end()) {
+		const float prev = static_cast<float>(it->second);
+		if (desired <= prev * (1.0f + vsm::kLevelHysteresis) && desired >= prev * (1.0f - vsm::kLevelHysteresis))
+			level = it->second;                        // within the band -> hold last frame's rung
+		level = std::clamp(level, rtFloorFaceRes, rtMaxFaceRes);  // re-validate against current bounds
+	}
+	prevLightFaceRes[a_lightId] = level;
+	return level;
+}
+
+// Shelf-pack every active light's 3x2 cube-face block (sized by its per-light faceRes) into the atlas and
+// grow the atlas to fit (grow-only). Sets each LightRecord's atlasX/atlasY (pixel origin). Blocks vary in
+// size (variable resolution), so this replaces the old uniform grid. Tallest-first shelf packer; the
+// descriptor scheme (arbitrary per-light origin) lets a paged/buddy allocator replace it later without any
+// shader change (Phase 2). Target width = kAtlasBlocksWide MAX-size blocks.
+void VirtualShadowMaps::PackAtlas()
+{
+	const int targetW = vsm::kAtlasBlocksWide * (rtMaxFaceRes * 3);
+	std::vector<int> order(lightRecords.size());
+	std::iota(order.begin(), order.end(), 0);
+	std::sort(order.begin(), order.end(), [&](int a, int b) {
+		return lightRecords[a].positionWS.w > lightRecords[b].positionWS.w;  // tallest block first
+	});
+	int cursorX = 0, cursorY = 0, rowH = 0, usedW = 0;
+	for (const int i : order) {
+		const int fr = static_cast<int>(lightRecords[i].positionWS.w);
+		const int bw = fr * 3, bh = fr * 2;
+		if (cursorX > 0 && cursorX + bw > targetW) { cursorX = 0; cursorY += rowH; rowH = 0; }  // wrap to next shelf
+		lightRecords[i].atlasX = static_cast<float>(cursorX);
+		lightRecords[i].atlasY = static_cast<float>(cursorY);
+		cursorX += bw;
+		if (bh > rowH) rowH = bh;
+		if (cursorX > usedW) usedW = cursorX;
+	}
+	const int needW = (usedW > 0) ? usedW : (rtFloorFaceRes * 3);
+	const int needH = (cursorY + rowH > 0) ? (cursorY + rowH) : (rtFloorFaceRes * 2);
+	if (needW > rtAtlasW || needH > rtAtlasH) {
+		rtAtlasW = (needW > rtAtlasW) ? needW : rtAtlasW;   // grow-only (never thrash a shrink)
+		rtAtlasH = (needH > rtAtlasH) ? needH : rtAtlasH;
+		if (!CreateAtlasResources())
+			logger::error("VSM: atlas grow to {}x{} for {} lights FAILED (out of VRAM?)", rtAtlasW, rtAtlasH, lightRecords.size());
+		else
+			VSM_LOG("VSM: atlas grown to {}x{} (~{}MB) packing {} active lights @ variable res", rtAtlasW, rtAtlasH,
+			    (static_cast<std::int64_t>(rtAtlasW) * rtAtlasH * static_cast<std::int64_t>(sizeof(float))) / kBytesPerMB, lightRecords.size());
+	}
 }
 
 void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
@@ -517,8 +613,9 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 	// shadow-casting lights (braziers etc., which live in activeShadowLights) also get cubes.
 	// The sun and origin-positioned lights are skipped.
 	auto addLight = [&](RE::BSLight* bl) -> bool {
-		if (lightRecords.size() >= static_cast<size_t>(kMaxLights))
-			return false;  // atlas full — cap reached (capacity limit, not a filter)
+		// NO cap on shadow lights (the project's core design goal). The per-light GPU buffer AND the atlas
+		// both grow to fit every collected light (EnsureLightBuffer / PackAtlas). VRAM is the only limit,
+		// and per-light variable resolution keeps it small (see notes/VSM_VARIABLE_RESOLUTION.md).
 		if (!bl || bl == rt.sunLight)
 			return true;
 		// Only genuine shadow-casters — skip ambient/fill lights (the engine's own flags). This is the
@@ -557,17 +654,18 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 
 		const float    radius = niLight->GetLightRuntimeData().radius.x;  // this light's actual reach
 		const uint32_t idx    = static_cast<uint32_t>(lightRecords.size());
+		// Per-light cube-face resolution from the on-screen size metric (variable resolution, ladder rung).
+		const int faceRes = AssignFaceRes(radius, p, camPos, static_cast<const void*>(bl));
 		LightRecord r;
-		r.positionWS = { p.x, p.y, p.z, 1.0f };
+		r.positionWS = { p.x, p.y, p.z, static_cast<float>(faceRes) };  // w = this light's chosen faceRes rung
 		// far = the light's own radius: the shader's illumination cutoff is exactly d==radius
 		// (intensityFactor==1 => continue), so no shadow can exist past it. Not a tunable — a fact.
 		r.farPlane   = (std::max)(radius, 1.0f);
 		// near = far * kNearPlaneFraction, floored at kNearPlaneEpsilon world units. Calculated, not tuned
 		// (reverse-Z tolerates a small near plane). See VSMConstants.h.
 		r.nearPlane  = (std::max)(r.farPlane * vsm::kNearPlaneFraction, vsm::kNearPlaneEpsilon);
-		r.atlasCol   = idx % static_cast<uint32_t>(kLightsPerRow);
-		r.atlasRow   = idx / static_cast<uint32_t>(kLightsPerRow);
-		BuildCubeMatrices(XMVectorSet(p.x, p.y, p.z, 1.0f), r.nearPlane, r.farPlane, r.cubeVP);
+		// atlasX/atlasY (this block's pixel origin) are assigned by PackAtlas once every light's rung is known.
+		BuildCubeMatrices(XMVectorSet(p.x, p.y, p.z, 1.0f), r.nearPlane, r.farPlane, faceRes, r.cubeVP);
 		lightRecords.push_back(r);
 		lightNames.push_back(niLight->name.c_str() ? niLight->name.c_str() : "");  // identify the camera light in the dump
 		lightOwnerRef.push_back(niLight->GetUserData() ? niLight->GetUserData()->GetFormID() : 0);  // for the ref cull
@@ -697,14 +795,15 @@ void VirtualShadowMaps::UploadLightBuffer()
 		return;
 	D3D11_MAPPED_SUBRESOURCE m{};
 	if (SUCCEEDED(context->Map(lightBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-		const size_t n = (std::min)(lightRecords.size(), static_cast<size_t>(kMaxLights));
+		const size_t cap = static_cast<size_t>(lightBufCapacity);
+		const size_t n   = (std::min)(lightRecords.size(), cap);  // EnsureLightBuffer already grew cap >= count
 		if (n)
 			std::memcpy(m.pData, lightRecords.data(), n * sizeof(LightRecord));
-		// Zero unused slots so the shader's position match can't hit stale data
+		// Zero unused slots so the shader's nearest-light match (GetDimensions loop) can't hit stale data
 		// (real lights are never at the origin — see CollectLights).
-		if (n < static_cast<size_t>(kMaxLights))
+		if (n < cap)
 			std::memset(static_cast<uint8_t*>(m.pData) + n * sizeof(LightRecord), 0,
-			    (static_cast<size_t>(kMaxLights) - n) * sizeof(LightRecord));
+			    (cap - n) * sizeof(LightRecord));
 		context->Unmap(lightBuffer.Get(), 0);
 	}
 }
@@ -722,8 +821,8 @@ void VirtualShadowMaps::UpdateDebugCB()
 	const RE::NiPoint3 eye{ sceneCameraPos.x, sceneCameraPos.y, sceneCameraPos.z };
 
 	const VSMDebugCB cb{
-		vsm::kDebugModeBias, dbgMode, dbgVizScale, dbgSampleSpace,   // row 0 (gBiasWorld = debug mode 15 only)
-		vsm::kDebugModeMatchThresh, dbgCompareMode, dbgMatchEye, (float)rtFaceRes,  // row 1 (gMatchThresh = debug mode 16 only; spare -> runtime faceRes)
+		rtBiasScale, dbgMode, dbgVizScale, dbgSampleSpace,   // row 0 (biasScale = fShadowBiasScale multiplier on the calc bias)
+		vsm::kDebugModeMatchThresh, dbgCompareMode, dbgMatchEye, (float)rtPCFRadius,  // row 1 (pcfRadius = PCF half-width from iBlurDeferredShadowMask)
 		eye.x, eye.y, eye.z, probeArmed ? 1 : 0,             // row 2 (probeArmed -> write pixel probe to u8)
 		probeFracX * screenW, probeFracY * screenH, (float)rtAtlasH, (float)rtAtlasW,  // row 3 (ppad0/1 -> atlasH/atlasW)
 	};
@@ -737,7 +836,7 @@ void VirtualShadowMaps::UpdateDebugCB()
 
 // Six 90-degree perspective faces of a cube centred on the light. Face order (+X,-X,+Y,-Y,
 // +Z,-Z) and the up vectors below MUST match VSM.hlsli's face selection + sampling.
-void VirtualShadowMaps::BuildCubeMatrices(FXMVECTOR a_eye, float a_near, float a_far, XMFLOAT4X4 a_outVP[6])
+void VirtualShadowMaps::BuildCubeMatrices(FXMVECTOR a_eye, float a_near, float a_far, int a_faceRes, XMFLOAT4X4 a_outVP[6])
 {
 	// Side faces (+X,-X,+Y,-Y) use world-Z up; the top/bottom faces (+Z,-Z) look along Z,
 	// so they use world-Y up instead.
@@ -755,7 +854,7 @@ void VirtualShadowMaps::BuildCubeMatrices(FXMVECTOR a_eye, float a_near, float a
 	// overlap by ~one texel. A receiver whose direction lands right on a face seam then still finds
 	// valid rasterized depth on the picked face instead of the wrong neighbour, removing seam bars.
 	// The shader samples with these exact matrices, so it stays self-consistent (no shader change).
-	const float fovR = 2.0f * std::atan(static_cast<float>(rtFaceRes) / (static_cast<float>(rtFaceRes) - 2.0f));  // guard band (~1 texel overlap)
+	const float fovR = 2.0f * std::atan(static_cast<float>(a_faceRes) / (static_cast<float>(a_faceRes) - 2.0f));  // guard band (~1 texel overlap), per this light's face resolution
 	XMMATRIX proj = XMMatrixPerspectiveFovLH(fovR, 1.0f, a_near, a_far);   // standard-Z: near->0, far->1
 	if (vsm::internal::kReverseZ) {
 		// Reverse-Z (Skyrim's convention): remap NDC z -> 1 - z, so near->1, far->0 for uniform float-depth
@@ -1436,8 +1535,8 @@ void VirtualShadowMaps::RenderDepth()
 	// cube every frame is the dominant cost -- becomes GPU-driven indirect + static/dynamic caching
 	// once the base is correct.
 	for (const auto& light : lightRecords) {
-		const int blockX = static_cast<int>(light.atlasCol) * rtBlockW;
-		const int blockY = static_cast<int>(light.atlasRow) * rtBlockH;
+		const int blockX = static_cast<int>(light.atlasX);  // pixel origin (was atlasCol * rtBlockW)
+		const int blockY = static_cast<int>(light.atlasY);
 
 		for (int f = 0; f < 6; ++f) {   // 6 cube faces (structural)
 			const int col = f % 3, row = f / 3;   // 3x2 face block (structural)
@@ -1506,7 +1605,8 @@ void VirtualShadowMaps::RenderFrame()
 	}
 
 	CollectLights(ssn);      // gather all active local lights -> lightRecords + assign atlas blocks
-	EnsureAtlas(activeLightCount);  // grow the atlas to fit the active lights (pay for what's on, not kMaxLights)
+	PackAtlas();                    // assign each light's variable-res block origin + grow the atlas to fit
+	EnsureLightBuffer(activeLightCount);  // grow the per-light GPU buffer to fit ALL active lights — no cap
 	BuildCasterBounds();     // per-caster frustum spheres, in the draw's absolute space
 #if VSM_DIAGNOSTICS
 	TrackCasterMotion();     // flag casters whose render origin rides the camera (camera-relative-space bug)
@@ -1547,7 +1647,10 @@ void VirtualShadowMaps::DrawMenu()
 		return;
 	}
 
-	settingsDirty |= ImGui::Checkbox("Enabled##VSM", &enabled);  // deploy menu shows ONLY this
+	settingsDirty |= ImGui::Checkbox("Enabled##VSM", &enabled);  // deploy menu shows ONLY this + the quality slider
+	ImGui::SetNextItemWidth(140.0f);
+	settingsDirty |= ImGui::SliderFloat("Shadow quality (k)##VSM", &vsm::GetConfig().qualityFactor, 0.25f, 4.0f, "%.2f");
+	ImGui::SameLine(); ImGui::TextDisabled("texels/pixel; higher = sharper + more VRAM");
 
 #if VSM_DIAGNOSTICS
 	ImGui::SameLine();

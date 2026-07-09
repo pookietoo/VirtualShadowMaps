@@ -82,7 +82,7 @@ private:
 	void CollectLights(RE::ShadowSceneNode* a_ssn);    // gather all active local lights -> lightRecords
 	void UploadLightBuffer();                          // mirror lightRecords into the GPU structured buffer
 	void UpdateDebugCB();                              // push the live tuning sliders to the shader cbuffer
-	void BuildCubeMatrices(DirectX::FXMVECTOR a_eye, float a_near, float a_far, DirectX::XMFLOAT4X4 a_outVP[6]);  // 6 cube-face view-projs (per-light near/far)
+	void BuildCubeMatrices(DirectX::FXMVECTOR a_eye, float a_near, float a_far, int a_faceRes, DirectX::XMFLOAT4X4 a_outVP[6]);  // 6 cube-face view-projs (per-light near/far; faceRes for the guard-band FOV)
 	void RebuildRegistrySafe(RE::NiAVObject* a_obj);            // SEH-guarded entry (traversal can hit bad geometry)
 	void RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::FormID a_owner = 0, bool a_underBillboard = false);  // recursive; skips LOD/sky + caps depth; tags casters with owning ref; a_underBillboard = descended through a NiBillboardNode (camera-facing effect -> excluded)
 	void RebuildFromReferences();                              // player 3D + loaded-cell references (room/NPCs/clutter)
@@ -124,12 +124,13 @@ private:
 	// rendered with (avoids re-deriving the cube projection and getting it subtly wrong).
 	struct LightRecord
 	{
-		DirectX::XMFLOAT4   positionWS = {};    // xyz = light pos (float4 avoids HLSL float3 packing ambiguity)
+		DirectX::XMFLOAT4   positionWS = {};    // xyz = light pos; w = faceRes (per-light cube-face resolution, texels)
 		float               farPlane   = 0.0f;  // offset 16
 		float               nearPlane  = 0.0f;  // 20
-		uint32_t            atlasCol   = 0;      // 24
-		uint32_t            atlasRow   = 0;      // 28
+		float               atlasX     = 0.0f;  // 24 — pixel origin X of this light's 3x2 block in the atlas
+		float               atlasY     = 0.0f;  // 28 — pixel origin Y (cubeVP stays at 32; size/layout unchanged)
 		DirectX::XMFLOAT4X4 cubeVP[6]  = {};     // 32 — world -> face-clip, per cube face (MUST match VSM.hlsli)
+		float faceRes() const { return positionWS.w; }  // per-light cube-face resolution (texels); non-virtual -> no layout change
 	};
 
 	// cached engine D3D (not owned)
@@ -142,9 +143,24 @@ private:
 	// we actually allocate. NOTE: the dense atlas holds kMaxLights x 6 faces, so faceRes is bounded for now
 	// (VRAM); the uncapped, full-ini-resolution path arrives with active-light / virtual sizing.
 	int rtFaceRes = vsm::kFaceRes, rtBlockW = vsm::kBlockW, rtBlockH = vsm::kBlockH, rtAtlasW = vsm::kAtlasW, rtAtlasH = vsm::kAtlasH;
-	void ComputeAtlasDims();        // read iShadowMapResolution -> rtFaceRes/block dims (once, before setup)
+	// Variable-resolution ladder bounds, from iShadowMapResolution (ComputeAtlasDims). rtMaxFaceRes = top rung
+	// (exact ini value); rtFloorFaceRes = smallest rung (min(kFloorFaceRes, max)). Per-light faceRes rides in
+	// LightRecord.positionWS.w; rtFaceRes/rtBlockW/H stay = the MAX (reference for the packer + diagnostics).
+	int rtMaxFaceRes = vsm::kFaceRes, rtFloorFaceRes = vsm::kFloorFaceRes;
+	// SkyrimPrefs shadow keys we honor (read once in ComputeAtlasDims; we ARE the local shadow system now, so
+	// preserve the user's intent). Fed to the shader via b13 (bias/blur) or the level metric.
+	float rtBiasScale      = 1.0f;    // fShadowBiasScale -> multiplier on the calculated per-pixel bias (may be <0)
+	int   rtPCFRadius      = 2;       // iBlurDeferredShadowMask -> soft-shadow PCF kernel half-width in texels (0 = hard)
+	float rtShadowDistance = 8000.0f; // fShadowDistance -> camera-distance shadow reach (feeds the parked fade/cull, #10)
+	void ComputeAtlasDims();        // read iShadowMapResolution -> ladder bounds (max/floor) + block dims (once, before setup)
 	bool CreateAtlasResources();    // (re)create depth+id atlas textures/views at rtAtlasW x rtAtlasH
-	void EnsureAtlas(int nLights);  // grow the atlas to fit the ACTIVE light count (called each frame)
+	// Per-frame variable-resolution: pick each light's cube-face rung on the pow2 ladder from the on-screen
+	// size metric (radius/dist), with hysteresis; then pack the per-light 3x2 blocks into the atlas + size it.
+	int  AssignFaceRes(float a_radius, const RE::NiPoint3& a_lightPos, const RE::NiPoint3& a_camPos, const void* a_lightId);
+	void PackAtlas();               // assign each light's atlasX/atlasY + grow the atlas to fit (shelf packer)
+	bool CreateLightBufferResources(int cap);  // (re)create the per-light structured buffer + SRV at cap elements
+	void EnsureLightBuffer(int nLights);        // grow the per-light buffer to fit ALL active lights (no cap)
+	int  lightBufCapacity = vsm::kMaxLights;    // current element capacity of lightBuffer (grows on demand)
 
 	// our resources
 	ComPtr<ID3D11Texture2D>          depthTex;
@@ -249,7 +265,7 @@ private:
 	// Fill casterWorldSphere per-frame from each caster's CURRENT world AABB (GetFreshWorldAABB) — one space
 	// with the draw (absolute world via geom->world), so no worldBound.center anywhere in RenderDepth's cull.
 	void BuildCasterBounds();
-	std::vector<LightRecord>         lightRecords;   // all shadowed lights this frame (<= kMaxLights)
+	std::vector<LightRecord>         lightRecords;   // all shadowed lights this frame (NO cap; buffer grows to fit)
 	std::vector<std::string>         lightNames;     // parallel to lightRecords: NiLight name (identify the camera light)
 	std::vector<RE::FormID>          lightOwnerRef;  // parallel to lightRecords: the light's TESObjectREFR (GetUserData) — drives the ref-cull
 	std::vector<RE::FormID>          lightNodeRef;   // parallel: the ref the light's NiNode actually hangs under (attached-light case)
@@ -360,6 +376,7 @@ private:
 	// static neighbour). Compared against cameraMovedThisFrame to spot a shadow that rides the camera.
 	std::vector<const void*>       lightPtrs;      // parallel to lightRecords: the BSLight* identity
 	std::unordered_map<const void*, DirectX::XMFLOAT3> prevLightById;  // BSLight* -> last-frame world pos
+	std::unordered_map<const void*, int>               prevLightFaceRes;  // BSLight* -> last-frame chosen face rung (hysteresis)
 	DirectX::XMFLOAT3              prevSceneCameraPos{};
 	bool                           havePrevSceneCam    = false;
 	float                          cameraMovedThisFrame = 0.0f;  // |cameraPos - prevCameraPos| this frame (world units)

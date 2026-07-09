@@ -720,9 +720,6 @@ void VsmDiagnostics::DumpFocusedCaster(int a_idx)
 	auto& device       = m_core.device;
 	auto& context      = m_core.context;
 	auto& lightRecords = m_core.lightRecords;
-	auto& rtFaceRes    = m_core.rtFaceRes;
-	auto& rtBlockW     = m_core.rtBlockW;
-	auto& rtBlockH     = m_core.rtBlockH;
 	auto& rtAtlasW     = m_core.rtAtlasW;
 	auto& rtAtlasH     = m_core.rtAtlasH;
 
@@ -814,8 +811,8 @@ void VsmDiagnostics::DumpFocusedCaster(int a_idx)
 			const bool front = clip.w > kClipWFrontEps;
 			const float nx = front ? clip.x / clip.w : kNdcSentinel, ny = front ? clip.y / clip.w : kNdcSentinel, nz = front ? clip.z / clip.w : kNdcSentinel;
 			const bool inb = (nx >= -1 && nx <= 1 && ny >= -1 && ny <= 1 && nz >= 0 && nz <= 1);
-			const float au = (L.atlasCol * rtBlockW + ((face % 3) + (nx * 0.5f + 0.5f)) * rtFaceRes) / static_cast<float>(rtAtlasW);
-			const float av = (L.atlasRow * rtBlockH + ((face / 3) + (ny * -0.5f + 0.5f)) * rtFaceRes) / static_cast<float>(rtAtlasH);
+			const float au = (L.atlasX + ((face % 3) + (nx * 0.5f + 0.5f)) * L.positionWS.w) / static_cast<float>(rtAtlasW);
+			const float av = (L.atlasY + ((face / 3) + (ny * -0.5f + 0.5f)) * L.positionWS.w) / static_cast<float>(rtAtlasH);
 			logger::info("    v{}: local=({:.1f} {:.1f} {:.1f}) -> world=({:.1f} {:.1f} {:.1f})  face={} ndc=({:.3f} {:.3f} {:.4f}) atlasUV=({:.4f} {:.4f}) front={} inB={}",
 			    v, f[0], f[1], f[2], wp.x, wp.y, wp.z, kFaceName[face], nx, ny, nz, au, av, front ? 1 : 0, inb ? 1 : 0);
 		} else {
@@ -1012,8 +1009,8 @@ void VsmDiagnostics::DumpDiagnosticLog()
 	logger::info("atlas cfg: reverseZ={} (near->1, far->0, empty=0) cubeFOV=guard-band rasterDepthBias=0 slopeScaledBias=0 (shadow bias is computed in-shader on LINEAR distances)", kReverseZ);
 	if (auto* ssn = smState.shadowSceneNode[0]) {
 		auto& rt = ssn->GetRuntimeData();
-		logger::info("light-set provenance: engine activeLights={} activeShadowLights={} -> we collected={} (cap {}); large drop => dedup/origin-skip/cap",
-		    rt.activeLights.size(), rt.activeShadowLights.size(), lightRecords.size(), static_cast<int>(kMaxLights));
+		logger::info("light-set provenance: engine activeLights={} activeShadowLights={} -> we collected={} (NO cap; light-buffer capacity={}); a large drop = the !IsShadowLight()/ambient/viewer-attached/dedup/origin-skip filters, NOT a cap",
+		    rt.activeLights.size(), rt.activeShadowLights.size(), lightRecords.size(), m_core.lightBufCapacity);
 	}
 
 	if (lightRecords.empty() || registry.empty()) {
@@ -1377,19 +1374,20 @@ void VsmDiagnostics::DumpDiagnosticLog()
 	// centre to world, forward-project it, and return the linear diff. diff≈0 && reFace==f => the
 	// render matrix and the sample path are consistent for that face. Returns false if empty.
 	auto roundTrip = [&](const VirtualShadowMaps::LightRecord& Lr, int f, float& diff, int& reFace) -> bool {
+		const int lfr = static_cast<int>(Lr.positionWS.w);  // this light's per-face resolution (variable res)
 		const int tileX = f % 3, tileY = f / 3;
-		const int px0 = static_cast<int>(Lr.atlasCol) * rtBlockW + tileX * rtFaceRes;
-		const int py0 = static_cast<int>(Lr.atlasRow) * rtBlockH + tileY * rtFaceRes;
+		const int px0 = static_cast<int>(Lr.atlasX) + tileX * lfr;
+		const int py0 = static_cast<int>(Lr.atlasY) + tileY * lfr;
 		int bx = -1, by = -1; float bd = 0.0f, bDist = kBigDistance;  // bd init = reverse-Z far (0.0)
-		for (int y = 0; y < rtFaceRes; y += kFaceScanStride)
-			for (int x = 0; x < rtFaceRes; x += kFaceScanStride) {
+		for (int y = 0; y < lfr; y += kFaceScanStride)
+			for (int x = 0; x < lfr; x += kFaceScanStride) {
 				const float d = atlasAtPx(px0 + x, py0 + y);
 				if (d <= kEmptyDepthEps) continue;  // reverse-Z: empty/far texel = 0.0
-				const float cd = static_cast<float>((x - rtFaceRes / 2) * (x - rtFaceRes / 2) + (y - rtFaceRes / 2) * (y - rtFaceRes / 2));
+				const float cd = static_cast<float>((x - lfr / 2) * (x - lfr / 2) + (y - lfr / 2) * (y - lfr / 2));
 				if (cd < bDist) { bDist = cd; bx = x; by = y; bd = d; }
 			}
 		if (bx < 0) return false;
-		const float fu = (bx + 0.5f) / rtFaceRes, fv = (by + 0.5f) / rtFaceRes;
+		const float fu = (bx + 0.5f) / lfr, fv = (by + 0.5f) / lfr;
 		const XMMATRIX inv = XMMatrixInverse(nullptr, XMLoadFloat4x4(&Lr.cubeVP[f]));
 		XMFLOAT4 W4; XMStoreFloat4(&W4, XMVector4Transform(XMVectorSet(2.0f * fu - 1.0f, 1.0f - 2.0f * fv, bd, 1.0f), inv));
 		if (std::fabs(W4.w) < kClipWEps) return false;
@@ -1397,8 +1395,8 @@ void VsmDiagnostics::DumpDiagnosticLog()
 		reFace = faceFromDir(Wp.x - Lr.positionWS.x, Wp.y - Lr.positionWS.y, Wp.z - Lr.positionWS.z);
 		XMFLOAT4 C; XMStoreFloat4(&C, XMVector4Transform(XMVectorSet(Wp.x, Wp.y, Wp.z, 1.0f), XMLoadFloat4x4(&Lr.cubeVP[reFace])));
 		const float nx = C.x / C.w, ny = C.y / C.w;
-		const float su = (Lr.atlasCol * rtBlockW + ((reFace % 3) + (nx * 0.5f + 0.5f)) * rtFaceRes) / static_cast<float>(rtAtlasW);
-		const float sv = (Lr.atlasRow * rtBlockH + ((reFace / 3) + (ny * -0.5f + 0.5f)) * rtFaceRes) / static_cast<float>(rtAtlasH);
+		const float su = (Lr.atlasX + ((reFace % 3) + (nx * 0.5f + 0.5f)) * lfr) / static_cast<float>(rtAtlasW);
+		const float sv = (Lr.atlasY + ((reFace / 3) + (ny * -0.5f + 0.5f)) * lfr) / static_cast<float>(rtAtlasH);
 		diff = lin(bd, Lr.nearPlane, Lr.farPlane) - lin(atlasAtUV(su, sv), Lr.nearPlane, Lr.farPlane);
 		return true;
 	};
@@ -1416,6 +1414,7 @@ void VsmDiagnostics::DumpDiagnosticLog()
 	    castersRidingCam, casterRideMaxDelta, casterRideName.empty() ? "-" : casterRideName.c_str());
 	for (size_t li = 0; li < lightRecords.size(); ++li) {
 		const VirtualShadowMaps::LightRecord& L = lightRecords[li];
+		const int lfr = static_cast<int>(L.positionWS.w);  // this light's per-face resolution (variable res)
 		const float dCam = std::sqrt((L.positionWS.x - camPos.x) * (L.positionWS.x - camPos.x) +
 		                             (L.positionWS.y - camPos.y) * (L.positionWS.y - camPos.y) +
 		                             (L.positionWS.z - camPos.z) * (L.positionWS.z - camPos.z));
@@ -1431,9 +1430,9 @@ void VsmDiagnostics::DumpDiagnosticLog()
 		if (auto* rr = RE::TESForm::LookupByID<RE::TESObjectREFR>(lref))
 			if (auto* base = rr->GetBaseObject())
 				if (const char* e = base->GetFormEditorID()) lrefBase = e;
-		logger::info("L{:02d} '{}' ownerRef=0x{:08X}({}) posAbs={:9.1f} {:9.1f} {:9.1f} near={:6.2f} far={:8.2f} cell=({},{}) dCam={:.0f} dyn={} moveThisFrame={:.2f}u tint23=RGB({:.2f} {:.2f} {:.2f}) lightPosWS={:9.1f} {:9.1f} {:9.1f}",
+		logger::info("L{:02d} '{}' ownerRef=0x{:08X}({}) posAbs={:9.1f} {:9.1f} {:9.1f} near={:6.2f} far={:8.2f} atlasOrigin=({:.0f} {:.0f}) faceRes={:.0f} dCam={:.0f} dyn={} moveThisFrame={:.2f}u tint23=RGB({:.2f} {:.2f} {:.2f}) lightPosWS={:9.1f} {:9.1f} {:9.1f}",
 		    static_cast<int>(li), lname, lref, lrefBase, L.positionWS.x, L.positionWS.y, L.positionWS.z, L.nearPlane, L.farPlane,
-		    L.atlasCol, L.atlasRow, dCam, ldyn, lmove, t23r, t23g, t23b, L.positionWS.x - altEye.x, L.positionWS.y - altEye.y, L.positionWS.z - altEye.z);
+		    L.atlasX, L.atlasY, L.positionWS.w, dCam, ldyn, lmove, t23r, t23g, t23b, L.positionWS.x - altEye.x, L.positionWS.y - altEye.y, L.positionWS.z - altEye.z);
 		// FULL light-object identity: the GetUserData ref chain + the ref the light's NODE hangs under (they
 		// differ for an ATTACHED light) — so the log alone proves whether this light and the fire-pit mesh
 		// are the same object / share a parent, which is what the ref-cull relies on.
@@ -1463,11 +1462,11 @@ void VsmDiagnostics::DumpDiagnosticLog()
 		float pop[6]; float rtd[6]; int rtf[6]; float nod[6];  // nod = nearest-occluder linear distance
 		for (int f = 0; f < 6; ++f) {
 			const int tileX = f % 3, tileY = f / 3;
-			const int px0 = static_cast<int>(L.atlasCol) * rtBlockW + tileX * rtFaceRes;
-			const int py0 = static_cast<int>(L.atlasRow) * rtBlockH + tileY * rtFaceRes;
+			const int px0 = static_cast<int>(L.atlasX) + tileX * lfr;
+			const int py0 = static_cast<int>(L.atlasY) + tileY * lfr;
 			int popc = 0, total = 0; float mx = 0.0f;  // reverse-Z: track MAX depth = nearest occluder
-			for (int y = 0; y < rtFaceRes; y += kPopScanStride)
-				for (int x = 0; x < rtFaceRes; x += kPopScanStride) {
+			for (int y = 0; y < lfr; y += kPopScanStride)
+				for (int x = 0; x < lfr; x += kPopScanStride) {
 					++total; const float dd = atlasAtPx(px0 + x, py0 + y);
 					if (dd > kEmptyDepthEps) ++popc;  // populated = a real occluder was rasterized
 					if (dd > mx) mx = dd;
@@ -1519,18 +1518,18 @@ void VsmDiagnostics::DumpDiagnosticLog()
 			for (int f = 0; f < 6; ++f) if (!std::isnan(nod[f])) { tf = f; break; }
 			if (tf >= 0) {
 				const int tileX = tf % 3, tileY = tf / 3;
-				const int px0 = static_cast<int>(L.atlasCol) * rtBlockW + tileX * rtFaceRes;
-				const int py0 = static_cast<int>(L.atlasRow) * rtBlockH + tileY * rtFaceRes;
+				const int px0 = static_cast<int>(L.atlasX) + tileX * lfr;
+				const int py0 = static_cast<int>(L.atlasY) + tileY * lfr;
 				int bx = -1, by = -1; float bd = 0.0f, bDist = kBigDistance;  // bd init = reverse-Z far (0.0)
-				for (int y = 0; y < rtFaceRes; y += kFaceScanStride)
-					for (int x = 0; x < rtFaceRes; x += kFaceScanStride) {
+				for (int y = 0; y < lfr; y += kFaceScanStride)
+					for (int x = 0; x < lfr; x += kFaceScanStride) {
 						const float d = atlasAtPx(px0 + x, py0 + y);
 						if (d <= kEmptyDepthEps) continue;  // reverse-Z: skip empty/far texels, pick a real occluder
-						const float cd = static_cast<float>((x - rtFaceRes / 2) * (x - rtFaceRes / 2) + (y - rtFaceRes / 2) * (y - rtFaceRes / 2));
+						const float cd = static_cast<float>((x - lfr / 2) * (x - lfr / 2) + (y - lfr / 2) * (y - lfr / 2));
 						if (cd < bDist) { bDist = cd; bx = x; by = y; bd = d; }
 					}
 				if (bx >= 0) {
-					const float fu = (bx + 0.5f) / rtFaceRes, fv = (by + 0.5f) / rtFaceRes;
+					const float fu = (bx + 0.5f) / lfr, fv = (by + 0.5f) / lfr;
 					const XMMATRIX invM = XMMatrixInverse(nullptr, XMLoadFloat4x4(&L.cubeVP[tf]));
 					XMFLOAT4 W4; XMStoreFloat4(&W4, XMVector4Transform(XMVectorSet(2.0f * fu - 1.0f, 1.0f - 2.0f * fv, bd, 1.0f), invM));
 					if (std::fabs(W4.w) > kClipWEps) {
@@ -1543,8 +1542,8 @@ void VsmDiagnostics::DumpDiagnosticLog()
 						XMFLOAT4 C; XMStoreFloat4(&C, XMVector4Transform(XMVectorSet(Wt.x, Wt.y, Wt.z, 1.0f), XMLoadFloat4x4(&L.cubeVP[f2])));
 						if (C.w > kClipWFrontEps) {
 							const float nz = C.z / C.w, nx = C.x / C.w, ny = C.y / C.w;
-							const float su = (L.atlasCol * rtBlockW + ((f2 % 3) + (nx * 0.5f + 0.5f)) * rtFaceRes) / static_cast<float>(rtAtlasW);
-							const float sv = (L.atlasRow * rtBlockH + ((f2 / 3) + (ny * -0.5f + 0.5f)) * rtFaceRes) / static_cast<float>(rtAtlasH);
+							const float su = (L.atlasX + ((f2 % 3) + (nx * 0.5f + 0.5f)) * lfr) / static_cast<float>(rtAtlasW);
+							const float sv = (L.atlasY + ((f2 / 3) + (ny * -0.5f + 0.5f)) * lfr) / static_cast<float>(rtAtlasH);
 							const float occ = atlasAtUV(su, sv);
 							const float lp = lin(nz, L.nearPlane, L.farPlane), lo = lin(occ, L.nearPlane, L.farPlane);
 							const bool shadow = (lp - lo) > vsm::kDebugModeBias;

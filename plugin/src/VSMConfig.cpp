@@ -27,6 +27,9 @@ namespace
 		    "\n"
 		    "[general]\n"
 		    "enabled = {}\n"
+		    "# Shadow-resolution quality: target shadow texels per screen pixel for the variable-resolution\n"
+		    "# level picker. 1 = critically sampled; >1 sharper (more VRAM); <1 softer/cheaper. Default 1.\n"
+		    "qualityFactor = {}\n"
 		    "\n"
 		    "# [atlas] is COMPILE-TIME (baked into the shipped shader + GPU buffer sizing). Shown for\n"
 		    "# reference only; changing it here has NO effect until the plugin is rebuilt with new\n"
@@ -35,6 +38,7 @@ namespace
 		    "faceResolution = {}\n"
 		    "maxLights      = {}\n",
 		    c.enabled,
+		    c.qualityFactor,
 		    vsm::kFaceRes, vsm::kMaxLights);
 	}
 }
@@ -64,7 +68,8 @@ namespace vsm
 			return;
 		}
 
-		enabled = tbl["general"]["enabled"].value_or(enabled);
+		enabled       = tbl["general"]["enabled"].value_or(enabled);
+		qualityFactor = tbl["general"]["qualityFactor"].value_or(qualityFactor);
 
 		// Atlas geometry is compile-time; warn (don't apply) if the file disagrees.
 		const int faceRes   = tbl["atlas"]["faceResolution"].value_or(kFaceRes);
