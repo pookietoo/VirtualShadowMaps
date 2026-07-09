@@ -17,6 +17,8 @@ namespace vsm
 		// [general]
 		bool  enabled       = false;  // start with the feature OFF
 		float qualityFactor = 1.0f;   // k: target shadow texels per screen pixel (variable-res level picker); 1 = critically sampled
+		bool  cacheStaticShadows = false;  // P2 module (default OFF): cache static-geometry depth, re-render only dynamics each frame
+		bool  cullCasters        = false;  // P3 module (default OFF): drop lights behind the camera / beyond fShadowDistance (no visible shadow)
 
 		// Read the .toml (writing a documented default file if none exists) and validate the
 		// [atlas] section against the compiled constants. Safe to call once at startup.

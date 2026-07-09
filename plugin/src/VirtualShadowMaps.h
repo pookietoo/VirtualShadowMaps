@@ -116,6 +116,9 @@ private:
 		RE::FormID                    ownerRef     = 0;      // the TESObjectREFR this mesh belongs to. A shadow
 		                                                     // light's OWN housing (fire-pit rim/flame plane) shares
 		                                                     // the light's ref -> skip it (see RenderDepth ref cull).
+		bool                          isStatic     = false;  // R5 classification: STATIC = never moves (base Static/
+		                                                     // StaticCollection, not skinned, no anim controller) ->
+		                                                     // safe to CACHE once (P2). Else DYNAMIC (err this way).
 	};
 
 	// One record per shadow-casting light, uploaded to a GPU buffer so the LLF shader
@@ -158,6 +161,9 @@ private:
 	// size metric (radius/dist), with hysteresis; then pack the per-light 3x2 blocks into the atlas + size it.
 	int  AssignFaceRes(float a_radius, const RE::NiPoint3& a_lightPos, const RE::NiPoint3& a_camPos, const void* a_lightId);
 	void PackAtlas();               // assign each light's atlasX/atlasY + grow the atlas to fit (shelf packer)
+	bool CreateStaticCacheResources();  // (re)create staticDepthTex + staticDsv at rtAtlasW x rtAtlasH (P2)
+	bool EnsureStaticCache();           // lazily create the static cache when cacheStaticShadows is on; false if unavailable
+	void RenderCasterPass(int a_filter, bool a_drawSkinned);  // draw casters into the BOUND dsv/viewport; filter 0=all 1=static 2=dynamic
 	bool CreateLightBufferResources(int cap);  // (re)create the per-light structured buffer + SRV at cap elements
 	void EnsureLightBuffer(int nLights);        // grow the per-light buffer to fit ALL active lights (no cap)
 	int  lightBufCapacity = vsm::kMaxLights;    // current element capacity of lightBuffer (grows on demand)
@@ -166,6 +172,13 @@ private:
 	ComPtr<ID3D11Texture2D>          depthTex;
 	ComPtr<ID3D11DepthStencilView>   dsv;
 	ComPtr<ID3D11ShaderResourceView> srv;
+	// P2 static/dynamic caching (config.cacheStaticShadows): a STATIC-only depth cache (ours, NOT sampled by
+	// LLF). Each frame: bake static casters into it ONLY when invalidated, then live atlas = CopyResource(cache)
+	// + DYNAMIC casters rendered over it -> LLF samples the SAME single t110 atlas (shader unchanged, no CS fork).
+	ComPtr<ID3D11Texture2D>          staticDepthTex;   // static-only depth cache (D32), same size as depthTex
+	ComPtr<ID3D11DepthStencilView>   staticDsv;
+	bool staticCacheValid      = false;   // false -> re-bake static casters into staticDepthTex next frame
+	int  lastBakedRegistrySize = -1;      // registry size at last bake (a size change ~ cell change -> invalidate)
 	ComPtr<ID3D11VertexShader>       depthVS;
 	ComPtr<ID3D11InputLayout>        ilFull;    // POSITION R32G32B32_FLOAT (always; see RebuildRegistry)
 	// Occluder-id atlas: R32_UINT target rasterized alongside depth. Each draw writes (registryIndex+1);
@@ -367,6 +380,7 @@ private:
 	int               activeLightCount = 0;    // valid local lights this frame (shadow-casters, after filtering)
 	int               lightsAmbient    = 0;    // active lights skipped this frame: ambient/fill (never shadow)
 	int               lightsNonShadow  = 0;    // active lights skipped this frame: not flagged shadow-casters
+	int               lightsCulled     = 0;    // P3: lights dropped this frame (behind camera / beyond fShadowDistance)
 	int               lightsViewerAttached = 0;// active lights skipped this frame: attached to player/camera (ride the viewer)
 	int               lightsHidden         = 0;// active lights skipped this frame: hidden / app-culled (kHidden)
 	std::vector<uint8_t>           lightDynamic;   // per shadow-light: BSLight::dynamic (a moving/animated light?)
@@ -377,6 +391,15 @@ private:
 	std::vector<const void*>       lightPtrs;      // parallel to lightRecords: the BSLight* identity
 	std::unordered_map<const void*, DirectX::XMFLOAT3> prevLightById;  // BSLight* -> last-frame world pos
 	std::unordered_map<const void*, int>               prevLightFaceRes;  // BSLight* -> last-frame chosen face rung (hysteresis)
+	// STABLE atlas allocation (P1, performance): a light keeps the SAME atlas slot across frames so P2 can
+	// cache its static depth. Slots are allocated on a light's first appearance, reused while its resolution
+	// tier is unchanged, and LRU-freed when unseen. Freed slots recycle by exact size (freeSlots); a new size
+	// shelf-bumps the cursor. Replaces the old every-frame repack (which moved slots and defeated caching).
+	struct AtlasSlot { int x = 0, y = 0, w = 0, h = 0, faceRes = 0; std::uint64_t lastUsed = 0; };
+	std::unordered_map<const void*, AtlasSlot>                          lightSlots;   // BSLight* -> persistent atlas slot
+	std::unordered_map<std::uint64_t, std::vector<std::pair<int, int>>> freeSlots;    // (w<<32|h) -> freed (x,y) origins, reused same-size
+	int           atlasBumpX = 0, atlasBumpY = 0, atlasBumpRowH = 0;    // shelf-bump cursor for NEW slots (pixels)
+	std::uint64_t atlasFrame = 0;                                        // per-PackAtlas tick, drives LRU eviction
 	DirectX::XMFLOAT3              prevSceneCameraPos{};
 	bool                           havePrevSceneCam    = false;
 	float                          cameraMovedThisFrame = 0.0f;  // |cameraPos - prevCameraPos| this frame (world units)

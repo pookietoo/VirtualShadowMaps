@@ -30,6 +30,12 @@ namespace
 		    "# Shadow-resolution quality: target shadow texels per screen pixel for the variable-resolution\n"
 		    "# level picker. 1 = critically sampled; >1 sharper (more VRAM); <1 softer/cheaper. Default 1.\n"
 		    "qualityFactor = {}\n"
+		    "# Performance: cache static-geometry shadow depth and re-render only dynamic casters (actors, doors)\n"
+		    "# each frame — a large win in static scenes. Default false (module under validation).\n"
+		    "cacheStaticShadows = {}\n"
+		    "# Performance: cull shadow lights that are behind the camera or entirely beyond fShadowDistance\n"
+		    "# (they cast no visible shadow). Conservative. Default false (module under validation).\n"
+		    "cullCasters = {}\n"
 		    "\n"
 		    "# [atlas] is COMPILE-TIME (baked into the shipped shader + GPU buffer sizing). Shown for\n"
 		    "# reference only; changing it here has NO effect until the plugin is rebuilt with new\n"
@@ -39,6 +45,8 @@ namespace
 		    "maxLights      = {}\n",
 		    c.enabled,
 		    c.qualityFactor,
+		    c.cacheStaticShadows,
+		    c.cullCasters,
 		    vsm::kFaceRes, vsm::kMaxLights);
 	}
 }
@@ -69,7 +77,9 @@ namespace vsm
 		}
 
 		enabled       = tbl["general"]["enabled"].value_or(enabled);
-		qualityFactor = tbl["general"]["qualityFactor"].value_or(qualityFactor);
+		qualityFactor      = tbl["general"]["qualityFactor"].value_or(qualityFactor);
+		cacheStaticShadows = tbl["general"]["cacheStaticShadows"].value_or(cacheStaticShadows);
+		cullCasters        = tbl["general"]["cullCasters"].value_or(cullCasters);
 
 		// Atlas geometry is compile-time; warn (don't apply) if the file disagrees.
 		const int faceRes   = tbl["atlas"]["faceResolution"].value_or(kFaceRes);

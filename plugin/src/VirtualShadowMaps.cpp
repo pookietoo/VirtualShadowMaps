@@ -17,6 +17,7 @@
 
 // Path B (skinned characters): read skin partitions + the engine bone-matrix palette, CPU-skin, render.
 #include "RE/B/BSGeometry.h"
+#include "RE/F/FormTypes.h"            // FormType::Static/StaticCollection — static/dynamic caster classification
 #include "RE/B/BSDynamicTriShape.h"     // CPU-skinned posed verts (dynamicData)
 #include "RE/N/NiSkinInstance.h"        // GPU-skinned: skinData/skinPartition/bones/boneMatrices
 #include "RE/N/NiSkinData.h"            // inverse-bind (boneData[b].skinToBone)
@@ -329,7 +330,45 @@ bool VirtualShadowMaps::CreateAtlasResources()
 			device->CreateShaderResourceView(idTex.Get(), &isr, &idSRV);
 		}
 	}
+	// P2: keep the static-cache texture (if it exists) sized with the live atlas; recreating it drops the cache.
+	if (staticDepthTex)
+		CreateStaticCacheResources();
+	staticCacheValid = false;   // the live atlas was (re)created -> any cached static depth is gone; re-bake
 	return true;
+}
+
+// (Re)create the P2 static-cache depth texture + DSV at the current atlas size. Same D32_TYPELESS desc as the
+// live atlas so CopyResource(depthTex <- staticDepthTex) is legal. No SRV (it is never sampled — LLF only ever
+// sees the single live atlas). Failure is non-fatal: RenderDepth falls back to the non-cached single pass.
+bool VirtualShadowMaps::CreateStaticCacheResources()
+{
+	if (!device) return false;
+	staticDepthTex.Reset(); staticDsv.Reset();
+	D3D11_TEXTURE2D_DESC td{};
+	td.Width  = static_cast<UINT>(rtAtlasW);
+	td.Height = static_cast<UINT>(rtAtlasH);
+	td.MipLevels = 1; td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R32_TYPELESS;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_DEPTH_STENCIL;   // depth target only; never bound as an SRV
+	if (FAILED(device->CreateTexture2D(&td, nullptr, &staticDepthTex))) {
+		logger::error("VSM: static-cache texture creation failed ({}x{})", rtAtlasW, rtAtlasH);
+		return false;
+	}
+	D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+	dv.Format = DXGI_FORMAT_D32_FLOAT;
+	dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+	device->CreateDepthStencilView(staticDepthTex.Get(), &dv, &staticDsv);
+	staticCacheValid = false;
+	return staticDsv != nullptr;
+}
+
+// Lazily create the static cache the first time the P2 module is enabled. Returns false if unavailable.
+bool VirtualShadowMaps::EnsureStaticCache()
+{
+	if (staticDsv) return true;
+	return CreateStaticCacheResources();
 }
 
 void VirtualShadowMaps::SetupResources()
@@ -527,35 +566,64 @@ int VirtualShadowMaps::AssignFaceRes(float a_radius, const RE::NiPoint3& a_light
 // size (variable resolution), so this replaces the old uniform grid. Tallest-first shelf packer; the
 // descriptor scheme (arbitrary per-light origin) lets a paged/buddy allocator replace it later without any
 // shader change (Phase 2). Target width = kAtlasBlocksWide MAX-size blocks.
+// STABLE per-light atlas allocation (P1). Each light keeps the SAME atlas slot across frames while its
+// resolution tier is unchanged (so P2 can cache its static depth); slots are (re)allocated only on first
+// appearance or a tier change, LRU-freed when unseen, and recycled by exact block size. This REPLACES the
+// old every-frame repack (which moved every light's slot each frame and would defeat caching). The shader
+// is unchanged — it still reads the per-light {atlasX, atlasY, faceRes} descriptor.
 void VirtualShadowMaps::PackAtlas()
 {
+	++atlasFrame;
 	const int targetW = vsm::kAtlasBlocksWide * (rtMaxFaceRes * 3);
-	std::vector<int> order(lightRecords.size());
-	std::iota(order.begin(), order.end(), 0);
-	std::sort(order.begin(), order.end(), [&](int a, int b) {
-		return lightRecords[a].positionWS.w > lightRecords[b].positionWS.w;  // tallest block first
-	});
-	int cursorX = 0, cursorY = 0, rowH = 0, usedW = 0;
-	for (const int i : order) {
-		const int fr = static_cast<int>(lightRecords[i].positionWS.w);
-		const int bw = fr * 3, bh = fr * 2;
-		if (cursorX > 0 && cursorX + bw > targetW) { cursorX = 0; cursorY += rowH; rowH = 0; }  // wrap to next shelf
-		lightRecords[i].atlasX = static_cast<float>(cursorX);
-		lightRecords[i].atlasY = static_cast<float>(cursorY);
-		cursorX += bw;
-		if (bh > rowH) rowH = bh;
-		if (cursorX > usedW) usedW = cursorX;
+	auto freeKey = [](int w, int h) {
+		return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(w)) << 32) | static_cast<std::uint32_t>(h);
+	};
+	auto releaseSlot = [&](const AtlasSlot& s) { freeSlots[freeKey(s.w, s.h)].emplace_back(s.x, s.y); };
+	// Allocate a NEW slot: reuse a freed same-size slot (no fragmentation for same-size churn), else shelf-bump.
+	auto allocSlot = [&](int bw, int bh, int fr) -> AtlasSlot {
+		auto& fl = freeSlots[freeKey(bw, bh)];
+		if (!fl.empty()) {
+			const auto [fx, fy] = fl.back(); fl.pop_back();
+			return { fx, fy, bw, bh, fr, atlasFrame };
+		}
+		if (atlasBumpX > 0 && atlasBumpX + bw > targetW) { atlasBumpX = 0; atlasBumpY += atlasBumpRowH; atlasBumpRowH = 0; }  // wrap shelf
+		AtlasSlot s{ atlasBumpX, atlasBumpY, bw, bh, fr, atlasFrame };
+		atlasBumpX += bw;
+		if (bh > atlasBumpRowH) atlasBumpRowH = bh;
+		return s;
+	};
+
+	// 1. Give each active light a STABLE slot: reuse if the tier is unchanged, else (re)allocate.
+	for (size_t i = 0; i < lightRecords.size(); ++i) {
+		const void* id = (i < lightPtrs.size()) ? lightPtrs[i] : nullptr;
+		const int   fr = static_cast<int>(lightRecords[i].positionWS.w);
+		const int   bw = fr * 3, bh = fr * 2;
+		auto it = lightSlots.find(id);
+		if (it != lightSlots.end() && it->second.faceRes == fr) {
+			it->second.lastUsed = atlasFrame;                                   // reuse -> slot STABLE (cache survives)
+		} else {
+			if (it != lightSlots.end()) { releaseSlot(it->second); lightSlots.erase(it); }  // tier changed -> free old block
+			it = lightSlots.emplace(id, allocSlot(bw, bh, fr)).first;
+		}
+		lightRecords[i].atlasX = static_cast<float>(it->second.x);
+		lightRecords[i].atlasY = static_cast<float>(it->second.y);
 	}
-	const int needW = (usedW > 0) ? usedW : (rtFloorFaceRes * 3);
-	const int needH = (cursorY + rowH > 0) ? (cursorY + rowH) : (rtFloorFaceRes * 2);
+	// 2. LRU: release slots not used for a while so their space recycles (bounds the atlas over cell churn).
+	for (auto it = lightSlots.begin(); it != lightSlots.end();) {
+		if (atlasFrame - it->second.lastUsed > vsm::kSlotEvictFrames) { releaseSlot(it->second); it = lightSlots.erase(it); }
+		else ++it;
+	}
+	// 3. Grow the atlas to the shelf high-water mark (grow-only; slot pixel origins stay valid across a grow).
+	const int needW = (std::max)((atlasBumpY > 0) ? targetW : atlasBumpX, rtFloorFaceRes * 3);
+	const int needH = (std::max)(atlasBumpY + atlasBumpRowH, rtFloorFaceRes * 2);
 	if (needW > rtAtlasW || needH > rtAtlasH) {
-		rtAtlasW = (needW > rtAtlasW) ? needW : rtAtlasW;   // grow-only (never thrash a shrink)
+		rtAtlasW = (needW > rtAtlasW) ? needW : rtAtlasW;
 		rtAtlasH = (needH > rtAtlasH) ? needH : rtAtlasH;
 		if (!CreateAtlasResources())
-			logger::error("VSM: atlas grow to {}x{} for {} lights FAILED (out of VRAM?)", rtAtlasW, rtAtlasH, lightRecords.size());
+			logger::error("VSM: atlas grow to {}x{} FAILED (out of VRAM?)", rtAtlasW, rtAtlasH);
 		else
-			VSM_LOG("VSM: atlas grown to {}x{} (~{}MB) packing {} active lights @ variable res", rtAtlasW, rtAtlasH,
-			    (static_cast<std::int64_t>(rtAtlasW) * rtAtlasH * static_cast<std::int64_t>(sizeof(float))) / kBytesPerMB, lightRecords.size());
+			VSM_LOG("VSM: atlas grown to {}x{} (~{}MB); {} stable light slots", rtAtlasW, rtAtlasH,
+			    (static_cast<std::int64_t>(rtAtlasW) * rtAtlasH * static_cast<std::int64_t>(sizeof(float))) / kBytesPerMB, lightSlots.size());
 	}
 }
 
@@ -572,6 +640,7 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 	activeLightCount = 0;
 	lightsAmbient    = 0;
 	lightsNonShadow  = 0;
+	lightsCulled     = 0;
 	lightsViewerAttached = 0;
 	lightsHidden         = 0;
 	if (!a_ssn)
@@ -599,6 +668,12 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 		playerRoot = pc->Get3D();
 	if (auto* pcam = RE::PlayerCamera::GetSingleton())
 		cameraRoot = pcam->cameraRoot.get();
+	// P3 (cullCasters): camera forward = Y row of the camera rotation, for the behind-camera light cull.
+	RE::NiPoint3 camFwd{ 0.0f, 1.0f, 0.0f };
+	if (cameraRoot) {
+		const auto& cr = cameraRoot->world.rotate;
+		camFwd = { cr.entry[0][1], cr.entry[1][1], cr.entry[2][1] };
+	}
 
 	// Gather ALL active local lights (not the engine's shadow-limited subset) — the point
 	// of the mod is to shadow lights the engine dropped. Cap at kMaxLights (correctness-
@@ -653,6 +728,16 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 				return true;
 
 		const float    radius = niLight->GetLightRuntimeData().radius.x;  // this light's actual reach
+		// P3 broad-phase (cullCasters): drop lights that cast NO visible shadow — entirely behind the camera or
+		// entirely beyond fShadowDistance. Conservative (radius slack) so a light that could reach the view is
+		// never dropped. Culled = no atlas slot + no render + no sample.
+		if (vsm::GetConfig().cullCasters) {
+			const float dx = p.x - camPos.x, dy = p.y - camPos.y, dz = p.z - camPos.z;
+			const float fwd = dx * camFwd.x + dy * camFwd.y + dz * camFwd.z;          // signed distance along camera forward
+			if (fwd + radius < 0.0f) { ++lightsCulled; return true; }                 // whole reach behind the camera
+			const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+			if (dist - radius > rtShadowDistance) { ++lightsCulled; return true; }    // whole reach beyond fShadowDistance
+		}
 		const uint32_t idx    = static_cast<uint32_t>(lightRecords.size());
 		// Per-light cube-face resolution from the on-screen size metric (variable resolution, ladder rung).
 		const int faceRes = AssignFaceRes(radius, p, camPos, static_cast<const void*>(bl));
@@ -731,6 +816,11 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 	prevLightById.clear();
 	for (size_t i = 0; i < lightRecords.size(); ++i)
 		prevLightById[lightPtrs[i]] = { lightRecords[i].positionWS.x, lightRecords[i].positionWS.y, lightRecords[i].positionWS.z };
+	// P2: a collected light MOVED (mv > eps) or a NEW light appeared (mv == -1) -> the cached static depth,
+	// baked in each light's cube space, is stale. Invalidate so RenderDepth re-bakes. Rare when standing still
+	// (Skyrim lights are mostly static + the light set is stable), so caching holds there.
+	for (const float mv : lightMove)
+		if (mv < 0.0f || mv > vsm::kLightMoveEps) { staticCacheValid = false; break; }
 	haveTestLight    = !lightRecords.empty();
 
 	// Diagnostics: highlight the selected light (or nearest if none selected).
@@ -914,6 +1004,33 @@ void VirtualShadowMaps::RebuildFromReferences()
 	}
 }
 
+// Classify a caster STATIC (safe to cache its depth once — P2) vs DYNAMIC (re-render each frame). Err toward
+// DYNAMIC: a mis-cached mover shows a frozen shadow, so the asymmetry must favour "don't cache". Recipe from
+// the R5 research (notes/VSM_PERFORMANCE_PLAN.md); runs once per registry rebuild, cached on CasterEntry.
+static bool IsCasterStatic(RE::BSGeometry* a_g, RE::FormID a_ownerRef)
+{
+	if (!a_g)
+		return false;
+	// 0. Skinned geometry deforms every frame -> DYNAMIC.
+	if (a_g->AsDynamicTriShape())                    return false;  // head/hair/face morph (BSDynamicTriShape)
+	if (a_g->GetGeometryRuntimeData().skinInstance)  return false;  // bone-skinned (actors, cloth)
+	// 1. An animation controller on the node or ANY ancestor drives the transform in place (MovableStatic
+	//    flames, swinging chains, spinning wheels) -> DYNAMIC. Cheapest catch for the animated-MSTT case.
+	for (RE::NiAVObject* n = a_g; n; n = n->parent)
+		if (n->GetControllers())                     return false;
+	// 2. Base FormType via the owning reference: only worldspace STATIC / StaticCollection is safe to cache.
+	if (a_ownerRef) {
+		if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(a_ownerRef))
+			if (auto* base = ref->GetBaseObject()) {
+				const RE::FormType ft = base->GetFormType();
+				if (ft == RE::FormType::Static || ft == RE::FormType::StaticCollection)
+					return true;
+			}
+	}
+	// 3. Default: DYNAMIC (actors/doors/activators/furniture/trees/loose havok clutter/ownerRef==0).
+	return false;
+}
+
 void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::FormID a_owner, bool a_underBillboard)
 {
 	if (!a_obj || a_depth > vsm::kMaxSceneGraphDepth)  // depth cap guards against scene-graph cycles
@@ -1015,6 +1132,7 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::
 			e.indexCount   = triCount * 3u;
 			e.twoSided     = twoSided;
 			e.ownerRef     = a_owner;
+			e.isStatic     = IsCasterStatic(tri, a_owner);       // R5: cache-safe worldspace statics
 			registry.push_back(std::move(e));
 		}
 	}
@@ -1473,90 +1591,33 @@ void VirtualShadowMaps::DrawSkinnedRange(const SkinnedRange& r, DirectX::FXMMATR
 	++visibleCasters;
 }
 
-void VirtualShadowMaps::RenderDepth()
+// Draw casters into the CURRENTLY-BOUND dsv/viewport, looping all lights x 6 cube faces at each light's OWN
+// faceRes (variable resolution). filter: 0=all, 1=static-only, 2=dynamic-only. drawSkinned adds the
+// CPU-skinned character ranges (always dynamic). Pipeline state (VS/PS/IL/CB/raster/depth) must be set by the
+// caller. SPACE: DRAW and CULL are ONE absolute-world space (cubeVP from absolute light pos; static
+// geom->world is game-absolute; skinned verts posed to absolute; cull sphere from the SAME geom->world).
+void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 {
-	visibleCasters = 0;
-	if (!dsv)
-		return;
-
-	GraphicsStateGuard guard(context);
-
-	// Occluder-id atlas is only needed on a DUMP frame (it's read by the dump), so populate it only then —
-	// normal frames stay depth-only (no extra pixel-shader cost). dbgLogRequested is still set here; it's
-	// consumed just after RenderDepth (see RenderFrame).
-	const bool wantId = idRTV && idPS && dbgLogRequested;
-	ID3D11RenderTargetView* rtvBind = wantId ? idRTV.Get() : nullptr;
-
-	// Explicitly unbind the atlas SRV before binding it as our DSV. The atlas texture is one resource with
-	// BOTH views (dsv + srv); LightLimitFix::Prepass binds our GetAtlasSRV() at t110 (see VSM_GetShadow
-	// resources) for the game's lighting shader to sample, and that binding lingers until Present, where we
-	// run and write the same resource as depth. Binding it as DSV while it's still an input is a read/write
-	// hazard: D3D11 would auto-null the slot anyway (a per-frame debug-layer warning), so we do it explicitly
-	// — no reliance on implicit behavior, no warning. LLF re-binds it next Prepass, so this is safe. We null
-	// both PS and CS in case the lighting pass is compute (nulling an unbound slot is a no-op). Slot number =
-	// vsm::kShadowAtlasSRVSlot (the CS<->plugin binding contract, VSMConstants.h).
-	ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
-	context->PSSetShaderResources(vsm::kShadowAtlasSRVSlot, 1, nullSRV);
-	context->CSSetShaderResources(vsm::kShadowAtlasSRVSlot, 1, nullSRV);
-
-	context->OMSetRenderTargets(1, &rtvBind, dsv.Get());
-	context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, kReverseZ ? 0.0f : 1.0f, 0);
-	if (wantId) { const float zeros[4] = { 0, 0, 0, 0 }; context->ClearRenderTargetView(idRTV.Get(), zeros); }  // 0 = empty texel
-
-	// No local shadow light picked (e.g. outdoors in daylight — the sun is a directional
-	// source handled elsewhere, not here) or nothing loaded: leave the map cleared so the
-	// preview shows black instead of freezing on a stale frame.
-	if (!haveTestLight || registry.empty())
-		return;
-
-	// Shared pipeline state for all 6 faces.
-	context->RSSetState(rasterState.Get());
-	context->OMSetDepthStencilState(depthState.Get(), 0);
-	context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	context->VSSetShader(depthVS.Get(), nullptr, 0);
-	context->PSSetShader(wantId ? idPS.Get() : nullptr, nullptr, 0);  // id PS writes CasterId into idTex (dump frames only)
-	context->IASetInputLayout(ilFull.Get());  // position is always R32G32B32_FLOAT
-	auto* cb = perDrawCB.Get();
-	context->VSSetConstantBuffers(0, 1, &cb);
-	if (wantId) context->PSSetConstantBuffers(0, 1, &cb);  // PS reads CasterId from the same per-draw CB
-
-	// SPACE MODEL — DRAW and CULL are ONE space: ABSOLUTE world, one frame, no camera offset.
-	//   * the light cubes (cubeVP) are built from ABSOLUTE light positions,
-	//   * the shader samples with ABSOLUTE world positions,
-	//   * static caster geom->world.translate is game-absolute (see [[skyrim-world-space-not-camera-relative]]),
-	//   * CPU-skinned verts are posed to ABSOLUTE world in SkinAllCasters (run in RenderFrame, before this).
-	// DRAW: a caster's clip = modelPos * World * cubeVP (statics) or modelPos * cubeVP (already-posed skinned) —
-	// straight through, NO T(cameraPos). CULL: the frustum sphere (casterWorldSphere) is derived from the SAME
-	// geom->world via GetFreshWorldAABB — NOT geom->worldBound.center, whose separate maintenance made it
-	// AMBIGUOUS whether the cull matched the draw's space. So both DRAW and CULL are provably in the same
-	// absolute-world space, with no camera offset applied anywhere.
-
-	// Every light = 6 cube faces rendered into its atlas block. NOTE: rendering every light's full
-	// cube every frame is the dominant cost -- becomes GPU-driven indirect + static/dynamic caching
-	// once the base is correct.
+	const bool blinkOff = (flashCaster >= 0) && (((frameIndex / kFlashHalfPeriodFrames) % 2u) == 1u);
 	for (const auto& light : lightRecords) {
-		const int blockX = static_cast<int>(light.atlasX);  // pixel origin (was atlasCol * rtBlockW)
+		const int blockX = static_cast<int>(light.atlasX);
 		const int blockY = static_cast<int>(light.atlasY);
-
-		for (int f = 0; f < 6; ++f) {   // 6 cube faces (structural)
-			const int col = f % 3, row = f / 3;   // 3x2 face block (structural)
-			const D3D11_VIEWPORT vp{ (float)(blockX + col * rtFaceRes), (float)(blockY + row * rtFaceRes),
-				(float)rtFaceRes, (float)rtFaceRes, 0.0f, 1.0f };
+		const int lfr    = static_cast<int>(light.positionWS.w);   // this light's face resolution (variable res)
+		for (int f = 0; f < 6; ++f) {                              // 6 cube faces (structural)
+			const int col = f % 3, row = f / 3;                    // 3x2 face block (structural)
+			const D3D11_VIEWPORT vp{ static_cast<float>(blockX + col * lfr), static_cast<float>(blockY + row * lfr),
+				static_cast<float>(lfr), static_cast<float>(lfr), 0.0f, 1.0f };
 			context->RSSetViewports(1, &vp);
-			const XMMATRIX faceVP = XMLoadFloat4x4(&light.cubeVP[f]);  // absolute-space cube VP; casters are absolute -> straight through
+			const XMMATRIX faceVP = XMLoadFloat4x4(&light.cubeVP[f]);
 			XMFLOAT4 planes[6];
-			ExtractFrustumPlanes(light.cubeVP[f], planes);  // absolute-space frustum (matches faceVP output)
-
-			// Flash selector: hide the chosen caster on the "off" half of a ~1/3 s cycle so its shadow
-			// winks on/off in the world (blinkOff true => don't draw it this frame). frameIndex ticks once
-			// per RenderFrame; ~20 frames on / 20 off.
-			const bool blinkOff = (flashCaster >= 0) && (((frameIndex / kFlashHalfPeriodFrames) % 2u) == 1u);
-
-			for (size_t i = 0; i < registry.size(); ++i)
+			ExtractFrustumPlanes(light.cubeVP[f], planes);
+			for (size_t i = 0; i < registry.size(); ++i) {
+				if (a_filter == 1 && !registry[i].isStatic) continue;   // static-only pass
+				if (a_filter == 2 &&  registry[i].isStatic) continue;   // dynamic-only pass
 				DrawStaticCaster(i, faceVP, planes, blinkOff);
-
+			}
 			// --- Path B: skinned characters (world-absolute posed buffer -> same cube VP, world=identity) ---
-			if (skinnedVB && skinnedIB && !skinnedRanges.empty()) {
+			if (a_drawSkinned && skinnedVB && skinnedIB && !skinnedRanges.empty()) {
 				ID3D11Buffer* svb = skinnedVB.Get();
 				UINT sstride = static_cast<UINT>(sizeof(XMFLOAT3)), soff = 0;
 				context->IASetVertexBuffers(0, 1, &svb, &sstride, &soff);
@@ -1566,6 +1627,87 @@ void VirtualShadowMaps::RenderDepth()
 			}
 		}
 	}
+}
+
+void VirtualShadowMaps::RenderDepth()
+{
+	visibleCasters = 0;
+	if (!dsv)
+		return;
+
+	GraphicsStateGuard guard(context);
+
+	// Occluder-id atlas is only needed on a DUMP frame; normal frames stay depth-only. It renders in the
+	// DYNAMIC/live pass only (static-cached ids aren't tracked — a diagnostic nuance under P2 caching).
+	const bool wantId = idRTV && idPS && dbgLogRequested;
+	ID3D11RenderTargetView* rtvBind = wantId ? idRTV.Get() : nullptr;
+
+	// Unbind the atlas SRV (t110) before we write it as DSV — read/write hazard; LLF re-binds it next Prepass.
+	ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
+	context->PSSetShaderResources(vsm::kShadowAtlasSRVSlot, 1, nullSRV);
+	context->CSSetShaderResources(vsm::kShadowAtlasSRVSlot, 1, nullSRV);
+
+	// Shared depth-only pipeline state (both P2 passes + the non-cached path).
+	auto setPipeline = [&](bool withId) {
+		context->RSSetState(rasterState.Get());
+		context->OMSetDepthStencilState(depthState.Get(), 0);
+		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		context->VSSetShader(depthVS.Get(), nullptr, 0);
+		context->PSSetShader(withId ? idPS.Get() : nullptr, nullptr, 0);
+		context->IASetInputLayout(ilFull.Get());  // position is always R32G32B32_FLOAT
+		auto* cb = perDrawCB.Get();
+		context->VSSetConstantBuffers(0, 1, &cb);
+		if (withId) context->PSSetConstantBuffers(0, 1, &cb);
+	};
+	const float clearZ = kReverseZ ? 0.0f : 1.0f;
+	const float zeros[4] = { 0, 0, 0, 0 };
+	const bool  cache    = vsm::GetConfig().cacheStaticShadows && EnsureStaticCache();
+
+	if (!cache) {
+		// --- P2 OFF: single pass. Clear the live atlas, draw ALL casters + skinned (baseline behaviour). ---
+		context->OMSetRenderTargets(1, &rtvBind, dsv.Get());
+		context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, clearZ, 0);
+		if (wantId) context->ClearRenderTargetView(idRTV.Get(), zeros);
+		if (!haveTestLight || registry.empty())
+			return;
+		setPipeline(wantId);
+		RenderCasterPass(0, true);
+		return;
+	}
+
+	// --- P2 ON: static/dynamic caching. ---
+	if (static_cast<int>(registry.size()) != lastBakedRegistrySize)   // a caster-count change ~ cell change
+		staticCacheValid = false;
+	if (!haveTestLight || registry.empty()) {
+		context->OMSetRenderTargets(1, &rtvBind, dsv.Get());
+		context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, clearZ, 0);   // don't freeze the preview
+		return;
+	}
+
+	// PASS 1 (only when the cache is invalid): bake STATIC casters into the static cache.
+	if (!staticCacheValid) {
+		ID3D11RenderTargetView* noRtv = nullptr;
+		context->OMSetRenderTargets(0, &noRtv, staticDsv.Get());     // depth-only, no id
+		context->ClearDepthStencilView(staticDsv.Get(), D3D11_CLEAR_DEPTH, clearZ, 0);
+		setPipeline(false);
+		RenderCasterPass(1, false);                                  // static casters only, no skinned
+		staticCacheValid      = true;
+		lastBakedRegistrySize = static_cast<int>(registry.size());
+		VSM_LOG("VSM P2: re-baked static cache ({} registry casters, {} lights) — cache HOLDS until a light moves/appears or the cell changes", registry.size(), lightRecords.size());
+	}
+
+	// COMPOSITE: live atlas <- cached static depth (single whole-resource copy; legal for depth). Unbind the
+	// static DSV first so the source isn't bound during the copy.
+	ID3D11RenderTargetView* noRtv2 = nullptr;
+	context->OMSetRenderTargets(0, &noRtv2, nullptr);
+	context->CopyResource(depthTex.Get(), staticDepthTex.Get());
+
+	// PASS 2: DYNAMIC casters + skinned over the copied static (NO clear -> keep the static baseline; reverse-Z
+	// GREATER depth-test composes dynamics in front of static).
+	context->OMSetRenderTargets(1, &rtvBind, dsv.Get());
+	if (wantId) context->ClearRenderTargetView(idRTV.Get(), zeros);
+	setPipeline(wantId);
+	RenderCasterPass(2, true);
 	// engine state restored by ~GraphicsStateGuard
 }
 
@@ -1651,6 +1793,10 @@ void VirtualShadowMaps::DrawMenu()
 	ImGui::SetNextItemWidth(140.0f);
 	settingsDirty |= ImGui::SliderFloat("Shadow quality (k)##VSM", &vsm::GetConfig().qualityFactor, 0.25f, 4.0f, "%.2f");
 	ImGui::SameLine(); ImGui::TextDisabled("texels/pixel; higher = sharper + more VRAM");
+	settingsDirty |= ImGui::Checkbox("Cache static shadows (P2 performance)##VSM", &vsm::GetConfig().cacheStaticShadows);
+	ImGui::SameLine(); ImGui::TextDisabled("re-render only dynamic casters each frame");
+	settingsDirty |= ImGui::Checkbox("Cull off-screen lights (P3 performance)##VSM", &vsm::GetConfig().cullCasters);
+	ImGui::SameLine(); ImGui::TextDisabled("drop lights behind camera / beyond fShadowDistance");
 
 #if VSM_DIAGNOSTICS
 	ImGui::SameLine();

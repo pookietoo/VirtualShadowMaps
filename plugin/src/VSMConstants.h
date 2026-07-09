@@ -48,6 +48,8 @@ namespace vsm
 
 	// ---- Fixed capacities / cadence ----
 	inline constexpr std::uint32_t kRebuildInterval    = 30;    // frames between scene-graph re-traversals
+	inline constexpr std::uint64_t kSlotEvictFrames    = 90;    // free a light's persistent atlas slot after this many frames unseen (LRU)
+	inline constexpr float         kLightMoveEps       = 0.5f;  // world-units a collected light must move to invalidate the P2 static cache
 	inline constexpr std::size_t   kMaxCasters         = 8192;  // registry hard cap (huge-cell / runaway guard)
 	inline constexpr int           kMaxSceneGraphDepth = 64;    // recursion-depth guard for RebuildRegistry's scene-graph traversal (cycle guard)
 

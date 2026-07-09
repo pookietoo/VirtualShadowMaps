@@ -848,6 +848,7 @@ void VsmDiagnostics::DumpDiagnosticLog()
 	auto& visibleCasters         = m_core.visibleCasters;
 	auto& lightsAmbient          = m_core.lightsAmbient;
 	auto& lightsNonShadow        = m_core.lightsNonShadow;
+	auto& lightsCulled           = m_core.lightsCulled;
 	auto& lightsViewerAttached   = m_core.lightsViewerAttached;
 	auto& lightsHidden           = m_core.lightsHidden;
 	auto& dumpOrdinal            = m_core.dumpOrdinal;
@@ -1002,8 +1003,8 @@ void VsmDiagnostics::DumpDiagnosticLog()
 	}
 	logger::info("atlas {}x{}  rtFaceRes={} rtBlockW={} rtBlockH={}  lights={} registry={} visibleCasters={}",
 	    rtAtlasW, rtAtlasH, rtFaceRes, rtBlockW, rtBlockH, lightRecords.size(), registry.size(), visibleCasters);
-	logger::info("light filter: shadow-casters(added)={} ambient(skipped)={} nonShadow(skipped)={} viewerAttached(skipped)={} hidden(skipped)={}  (only IsShadowLight & !ambient & !viewer-attached & !hidden cast; viewerAttached = torch/eye light riding the camera)",
-	    lightRecords.size(), lightsAmbient, lightsNonShadow, lightsViewerAttached, lightsHidden);
+	logger::info("light filter: shadow-casters(added)={} ambient(skipped)={} nonShadow(skipped)={} viewerAttached(skipped)={} hidden(skipped)={} culled-P3(behind/far)={}  (only IsShadowLight & !ambient & !viewer-attached & !hidden cast)",
+	    lightRecords.size(), lightsAmbient, lightsNonShadow, lightsViewerAttached, lightsHidden, lightsCulled);
 	logger::info("dump #{}  frame={}  CS resource-fetch: count={} lastFrame={} (frame-lastFrame={} -> 0/1 = CS binding our atlas NOW; large/stale = CS<->plugin handshake broken)",
 	    ++dumpOrdinal, frameIndex, resourceFetchCount, lastResourceFetchFrame, frameIndex - lastResourceFetchFrame);
 	logger::info("atlas cfg: reverseZ={} (near->1, far->0, empty=0) cubeFOV=guard-band rasterDepthBias=0 slopeScaledBias=0 (shadow bias is computed in-shader on LINEAR distances)", kReverseZ);
@@ -1021,13 +1022,14 @@ void VsmDiagnostics::DumpDiagnosticLog()
 
 	// ---- Registry health: valid buffers, triangle-count spread, absolute-space caster AABB. ----
 	{
-		int valid = 0; uint32_t triMin = 0xFFFFFFFFu, triMax = 0; uint64_t triSum = 0;
+		int valid = 0, nStatic = 0; uint32_t triMin = 0xFFFFFFFFu, triMax = 0; uint64_t triSum = 0;
 		XMFLOAT3 mn{ FLT_MAX, FLT_MAX, FLT_MAX }, mx{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
 		for (const auto& e : registry) {
 			RE::BSGeometry* g = e.geom.get();
 			if (!g) continue;
 			auto* grd = g->GetGeometryRuntimeData().rendererData;
 			if (grd && grd->vertexBuffer && grd->indexBuffer) ++valid;
+			if (e.isStatic) ++nStatic;
 			const uint32_t tri = e.indexCount / 3u;
 			triMin = (std::min)(triMin, tri); triMax = (std::max)(triMax, tri); triSum += tri;
 			const auto& c = g->worldBound.center;  // already world-absolute (geom world.translate is world space)
@@ -1038,6 +1040,8 @@ void VsmDiagnostics::DumpDiagnosticLog()
 		logger::info("registry: {} casters ({} with live buffers)  tris/caster min={} avg={} max={}  absAABB=[{:.0f} {:.0f} {:.0f}]..[{:.0f} {:.0f} {:.0f}]",
 		    n, valid, triMin == 0xFFFFFFFFu ? 0 : triMin, n ? static_cast<uint32_t>(triSum / n) : 0, triMax,
 		    mn.x, mn.y, mn.z, mx.x, mx.y, mx.z);
+		logger::info("caster class (R5): STATIC(cacheable)={} DYNAMIC(re-render)={}  |  atlas: {} stable light slots (P1 persistent allocation)",
+		    nStatic, static_cast<int>(n) - nStatic, m_core.lightSlots.size());
 	}
 
 	logger::info("capture rejections (BSTriShapes reached but NOT registered): noRendererData={} noVertexBuffer={} noIndexBuffer={} zeroTris={} duplicate={}",
