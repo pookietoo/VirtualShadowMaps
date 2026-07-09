@@ -16,11 +16,19 @@ namespace vsm::internal
 	// plugin DLL is actually running. Bump the description each build. (The SKSE plugin version
 	// number is separate — see Plugin.h / CMake project VERSION.)
 	inline constexpr char kBuildTag[] =
-	    "0.9.35 per-light jitter detector: BSLight::dynamic + per-frame position delta (find the moving shadow light)";
+	    "0.9.77 REMOVED the spatial fixture cull entirely (refGroupAABB / light-inside-object-box / MoveableStatic / kMaxShadowMagnification). It was suppressing the light's own housing to hide the room-spanning bar, but that bar was the SMOKE BILLBOARD (now excluded at registry build via NiBillboardNode, 0.9.76). Culling solid fixtures wrongly removed the fire pit's LEGITIMATE shadow. Now: opaque geometry casts naturally (fire pit / fuel / lamp block light where they sit); billboards & translucent effects are excluded at registry build. Frustum cull (casterWorldSphere, draw-space) kept. Carries 0.9.76 billboard exclusion + SRV hazard fix + culling-space unification. No shader change since 0.9.75 (reverse-Z shader still current).";
 
-	// Skyrim's main view is reverse-Z. Flip if the dumped map looks inverted; drives the depth
-	// clear value + DepthFunc (single source of truth for the atlas-generation pass).
-	inline constexpr bool kReverseZ = false;
+	// Depth convention for the shadow atlas. TRUE = reverse-Z (near->1, far->0), which is Skyrim's own
+	// main-view convention and gives uniform float-depth precision across the light's range. This flag is the
+	// SINGLE SOURCE OF TRUTH for the atlas-GENERATION side and now drives ALL of it consistently:
+	//   - the cube PROJECTION (BuildCubeMatrices: post-multiplies a z-flip when set),
+	//   - the depth CLEAR value (0.0 = far),
+	//   - the depth-test DepthFunc (GREATER = keep nearest).
+	// The atlas CONSUMERS must mirror this same convention by hand (there is no shared compile unit):
+	//   - the CS-side sampler  Shaders/VirtualShadowMaps/VSM.hlsli :: LinearizeCubeDepth,
+	//   - the offline verifier tools/shadow_truth.py :: _lin.
+	// If you ever flip this, flip those two to match (both are commented pointing back here).
+	inline constexpr bool kReverseZ = true;
 
 	// NiTransform (column-vector R*s + t) -> DirectXMath row-vector (v*M) matrix.
 	inline DirectX::XMMATRIX NiTransformToXM(const RE::NiTransform& t)
@@ -81,31 +89,7 @@ namespace vsm::internal
 		}
 	};
 
-	// ---- GPU shadow-math probe I/O (see VirtualShadowMaps.h). One thread per probe point runs the
-	// EXACT VSM::GetLocalShadow logic against the live atlas + light buffer and writes every
-	// intermediate out. These structs are sized in SetupResources and filled/read in the dump; they
-	// MUST stay byte-identical to the kProbeCS HLSL structs so the probe proves the real path. ----
-	struct ProbeIn   // must match kProbeCS ProbeIn
-	{
-		DirectX::XMFLOAT4 P;           // pixel/surface position, camera-relative (== shader input.WorldPosition)
-		DirectX::XMFLOAT4 lightPosWS;  // the light as LLF passes it (camera-relative to the FrameBuffer eye)
-	};
-	struct ProbeOut  // must match kProbeCS ProbeOut
-	{
-		DirectX::XMFLOAT4 W;           // xyz = sample-space position; w = sampleSpace used
-		DirectX::XMFLOAT4 absLight;    // xyz = match key (lightPosWS + matchEye); w = nearest buffer-light distance
-		DirectX::XMFLOAT4 ndc;         // xyz = ndc; w = clip.w
-		DirectX::XMFLOAT4 uv_occ;      // xy = atlasUV; z = occluder sampled; w = matched light index (-1 none)
-		DirectX::XMFLOAT4 result;      // x = linPix; y = linOcc; z = diff; w = shadowed? (1=shadow)
-		DirectX::XMFLOAT4 face_flags;  // x = face; y = inBounds; z = inFront; w = matched?(1/0)
-	};
-	struct alignas(16) ProbeCBData  // must match kProbeCS cbuffer ProbeCB
-	{
-		DirectX::XMFLOAT4 camAdjust;   // xyz used as FrameBuffer::CameraPosAdjust (we feed altEye — exact in 3rd person)
-		DirectX::XMFLOAT4 altEye;      // xyz render eye (posAdjust.getEye)
-		float    bias;        int compareMode; int matchEye; int sampleSpace;
-		float    matchThresh; int numProbes;   int pad0;     int pad1;
-	};
+	// (Former ProbeIn / ProbeOut / ProbeCBData compute-probe I/O structs removed; superseded by the pixel probe below.)
 
 	// Real-shader pixel probe readback (MUST match VSM.hlsli::VSMPixelProbe — 10 float4 = 160 bytes).
 	struct PixelProbe

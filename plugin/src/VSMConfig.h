@@ -15,14 +15,7 @@ namespace vsm
 	struct Config
 	{
 		// [general]
-		bool  enabled     = false;  // start with the feature on
-		bool  frustumCull = true;   // cull casters to each light's frustum
-
-		// [shadow] — quality knobs (mirror the live menu sliders)
-		float farScale       = 1.0f;   // farPlane  = light.radius * farScale
-		float nearFrac       = 0.01f;  // nearPlane = farPlane * nearFrac
-		float bias           = 3.0f;   // shadow bias, WORLD units
-		float matchThreshold = 5.0f;   // light-match distance, world units
+		bool  enabled     = false;  // start with the feature OFF
 
 		// Read the .toml (writing a documented default file if none exists) and validate the
 		// [atlas] section against the compiled constants. Safe to call once at startup.

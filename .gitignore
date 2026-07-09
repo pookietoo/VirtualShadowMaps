@@ -15,11 +15,18 @@ dist/
 # ---- Dev screenshots (not part of the project) ----
 screenshots/
 
-# ---- Logs (runtime + transient build logs) ----
+# ---- Logs (runtime dumps + binary sidecars: atlas/id/geom .bin, captured textures) — NEVER published ----
 *.log
+logs/
+
+# ---- Local dev/analysis tooling (offline shadow verifier) — not needed to compile or use the mod ----
+tools/
 
 # ---- Local design/roadmap notes (kept locally, not part of the shipped project) ----
 notes/
+
+# ---- Detailed local documentation (deep architecture write-up) — not part of the shipped project ----
+docs/
 
 # ---- Holding area for removed code (user empties this) ----
 trash/

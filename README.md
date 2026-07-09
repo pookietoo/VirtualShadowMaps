@@ -11,50 +11,16 @@ exposes a tiny generic menu hook, so nothing of ours lives in CS's DLL.
 
 ## Status
 
-Verified working in-game (build 0.9.35):
+Verified working in-game:
 
 - **Static local-light shadows** — rooms, furniture, held items; camera-stable.
-- **Skinned-character shadows** — the player and NPC bodies, via our own CPU skinning ("Path B")
-  using the engine's world-absolute bone matrices.
+- **Skinned-character shadows** — the player and NPC bodies, via our own CPU skinning using the
+  engine's world-absolute bone matrices.
 - **In-menu UI** — the settings panel renders inside the Community Shaders menu.
 
-Known open items (not yet solved — tracked in the design notes):
-
-- An **interior-specific "shadows shift" issue** (observed in the Sleeping Giant Inn) is under
-  investigation; the numeric/GPU probe tooling in `VirtualShadowMaps_Diagnostics.cpp` exists to
-  chase it.
-- **Head/hair** (`BSDynamicTriShape`) skinned meshes are decoded but not yet rendered.
-- Performance work (GPU-driven skinning, static/dynamic caching, a paged atlas) is planned, not done.
-
-## How it works
-
-Each frame, on an `IDXGISwapChain::Present` hook, the plugin:
-
-1. Gathers every active local light (not just the engine's shadow-limited subset) and lays out a
-   3×2 cube-face "block" per light in a shared depth atlas.
-2. Rebuilds a persistent registry of caster geometry from the scene graph + loaded references, and
-   CPU-skins skinned casters into a world-absolute posed buffer.
-3. Renders all six cube faces per light into the atlas with a minimal depth-only shader.
-4. Exposes the atlas + a per-light structured buffer + sampler to Community Shaders' Light Limit
-   Fix, which samples them in `Shaders/VirtualShadowMaps/VSM.hlsli`.
-
-Coordinate space is world-absolute throughout (matching how CS treats `ShadowSceneNode` positions).
-
-## Repository layout
-
-```
-plugin/src/
-  VirtualShadowMaps.{h,cpp}          core: setup, light collection, skinning, atlas render, menu
-  VirtualShadowMaps_Diagnostics.cpp  numeric dumps, GPU/pixel probes, scene census, preview
-  VSMConstants.h                     single source for atlas geometry (shared with the shaders)
-  VSMInternal.h                      helpers shared across the two translation units
-  VSMConfig.{h,cpp}                  TOML config + settings persistence
-  Plugin.cpp                         SKSE entry points + the Present / OMSetRenderTargets hooks
-Shaders/                             CS shader overrides — VSM.hlsli (ours) + CS-derived edits (see License)
-```
-
-`extern/` (CommonLibSSE-NG, vcpkg), `community-shaders/`, and the built `dist/` mod folder are not
-committed — see Building.
+Only opaque, solid, camera-independent geometry casts; billboards, transparent/effect surfaces,
+decals, and engine "does not cast" meshes are excluded. Translucent/alpha shadowing (tinted light
+through stained glass, etc.) and head/hair skinned meshes are not yet done.
 
 ## Building
 
@@ -73,6 +39,9 @@ Requirements: Windows, Visual Studio 2022+ with the C++ workload, CMake 3.21+, a
    The build deploys the DLL and copies the `Shaders/` overrides into `dist/Virtual Shadow Maps/` —
    a local, git-ignored mod folder (not published).
 
+The default is a shipping build. Pass `-DVSM_DEV_BUILD=ON` to compile in the development
+diagnostics/logging/debug apparatus.
+
 The in-menu panel additionally requires a **minimally-hooked `CommunityShaders.dll`** built from a
 Community Shaders **v1.7.3** checkout with a ~7-line generic add-on hook in `Menu.cpp` (two exports
 + a callback loop). CS's shaders and DLL must be the same version.
@@ -87,8 +56,8 @@ SKSE/Plugins/CommunityShaders.dll      the minimally-hooked CS build
 Shaders/...                            CS shader overrides that sample our atlas
 ```
 
-Runtime tunables live in `Data/SKSE/Plugins/VirtualShadowMaps.toml` (written with documented
-defaults on first launch) and are also editable live from the Community Shaders menu.
+Runtime settings live in `Data/SKSE/Plugins/VirtualShadowMaps.toml` (written with a documented
+default on first launch) and are also editable live from the Community Shaders menu.
 
 ## Relationship to Community Shaders & License
 

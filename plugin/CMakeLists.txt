@@ -8,7 +8,23 @@ add_compile_definitions(SKYRIM)
 add_library(${PROJECT_NAME} SHARED)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
 
+# ---- Development vs deployment build ---------------------------------------------------------------
+# DEPLOYMENT is the DEFAULT — a plain `cmake` of the checked-in tree produces the shipping build.
+# OFF (default) = deployment:  VSM_DIAGNOSTICS=0 AND VirtualShadowMaps_Diagnostics.cpp (the VsmDiagnostics
+#                              class) is dropped from the build entirely — core rendering + error logging only.
+# ON            = development: the diagnostics/logging/debug apparatus is compiled in (VSM_DIAGNOSTICS=1).
+#                              Opt in locally with -DVSM_DEV_BUILD=ON. See src/VSMBuildConfig.h.
+option(VSM_DEV_BUILD "Compile in the diagnostics/logging/debug apparatus (development build)" OFF)
+
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp" "src/*.h")
+if(VSM_DEV_BUILD)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VSM_DIAGNOSTICS=1)
+    message(STATUS "VSM: development build — diagnostics compiled in")
+else()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VSM_DIAGNOSTICS=0)
+    list(FILTER SOURCES EXCLUDE REGEX "VirtualShadowMaps_Diagnostics\\.cpp$")
+    message(STATUS "VSM: DEPLOYMENT build — diagnostics compiled out")
+endif()
 target_sources(${PROJECT_NAME} PRIVATE ${SOURCES})
 
 configure_file(cmake/Plugin.h.in ${CMAKE_CURRENT_BINARY_DIR}/cmake/Plugin.h @ONLY)
@@ -48,9 +64,17 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 set(VSM_MOD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../dist/Virtual Shadow Maps")
 set(VSM_MOD_PLUGINS "${VSM_MOD_DIR}/SKSE/Plugins")
 set(VSM_SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../Shaders")
+# Copy shader overrides ONLY when their CONTENTS change. `copy_directory` rewrote every file each
+# build, bumping mtimes, which makes Community Shaders recompile ALL shaders every launch even when
+# nothing changed (slow). `copy_if_different` leaves unchanged files — and their timestamps — alone,
+# so CS recompiles only on a real shader edit. Explicit list (only 3 override files); add a line here
+# if a new override shader is introduced under /Shaders.
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${VSM_MOD_PLUGINS}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${PROJECT_NAME}>" "${VSM_MOD_PLUGINS}/"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory "${VSM_SHADER_SRC}" "${VSM_MOD_DIR}/Shaders"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${VSM_MOD_DIR}/Shaders/LightLimitFix" "${VSM_MOD_DIR}/Shaders/VirtualShadowMaps"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VSM_SHADER_SRC}/Lighting.hlsl" "${VSM_MOD_DIR}/Shaders/Lighting.hlsl"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VSM_SHADER_SRC}/LightLimitFix/LightLimitFix.hlsli" "${VSM_MOD_DIR}/Shaders/LightLimitFix/LightLimitFix.hlsli"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VSM_SHADER_SRC}/VirtualShadowMaps/VSM.hlsli" "${VSM_MOD_DIR}/Shaders/VirtualShadowMaps/VSM.hlsli"
     VERBATIM
-    COMMENT "Deploying VirtualShadowMaps.dll + shaders -> dist/Virtual Shadow Maps/")
+    COMMENT "Deploying VirtualShadowMaps.dll + shaders (copy-if-different) -> dist/Virtual Shadow Maps/")

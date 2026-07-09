@@ -1,5 +1,6 @@
 #include "VSMConfig.h"
 #include "VSMConstants.h"
+#include "VSMBuildConfig.h"  // VSM_LOG (dev-only info logging)
 
 #include <toml++/toml.hpp>
 
@@ -25,14 +26,7 @@ namespace
 		    "# Runtime tunables — also editable live from the in-game menu, which saves back here.\n"
 		    "\n"
 		    "[general]\n"
-		    "enabled     = {}\n"
-		    "frustumCull = {}\n"
-		    "\n"
-		    "[shadow]\n"
-		    "farScale       = {:.3f}  # farPlane  = light radius * farScale\n"
-		    "nearFrac       = {:.4f}  # nearPlane = farPlane * nearFrac (precision knob)\n"
-		    "bias           = {:.2f}  # shadow bias, world units\n"
-		    "matchThreshold = {:.2f}  # light-match distance, world units\n"
+		    "enabled = {}\n"
 		    "\n"
 		    "# [atlas] is COMPILE-TIME (baked into the shipped shader + GPU buffer sizing). Shown for\n"
 		    "# reference only; changing it here has NO effect until the plugin is rebuilt with new\n"
@@ -40,8 +34,7 @@ namespace
 		    "[atlas]\n"
 		    "faceResolution = {}\n"
 		    "maxLights      = {}\n",
-		    c.enabled, c.frustumCull,
-		    c.farScale, c.nearFrac, c.bias, c.matchThreshold,
+		    c.enabled,
 		    vsm::kFaceRes, vsm::kMaxLights);
 	}
 }
@@ -59,7 +52,7 @@ namespace vsm
 		std::error_code ec;
 		if (!std::filesystem::exists(kConfigPath, ec)) {
 			Save();  // write a documented default so the options are discoverable
-			logger::info("VSM config: no file found; wrote default {}", kConfigPath);
+			VSM_LOG("VSM config: no file found; wrote default {}", kConfigPath);
 			return;
 		}
 
@@ -71,12 +64,7 @@ namespace vsm
 			return;
 		}
 
-		enabled     = tbl["general"]["enabled"].value_or(enabled);
-		frustumCull = tbl["general"]["frustumCull"].value_or(frustumCull);
-		farScale       = tbl["shadow"]["farScale"].value_or(farScale);
-		nearFrac       = tbl["shadow"]["nearFrac"].value_or(nearFrac);
-		bias           = tbl["shadow"]["bias"].value_or(bias);
-		matchThreshold = tbl["shadow"]["matchThreshold"].value_or(matchThreshold);
+		enabled = tbl["general"]["enabled"].value_or(enabled);
 
 		// Atlas geometry is compile-time; warn (don't apply) if the file disagrees.
 		const int faceRes   = tbl["atlas"]["faceResolution"].value_or(kFaceRes);
@@ -87,8 +75,7 @@ namespace vsm
 			             "until the plugin is rebuilt.",
 			    faceRes, maxLights, kFaceRes, kMaxLights);
 
-		logger::info("VSM config: loaded {} (enabled={} farScale={:.2f} nearFrac={:.3f} bias={:.1f} match={:.1f})",
-		    kConfigPath, enabled, farScale, nearFrac, bias, matchThreshold);
+		VSM_LOG("VSM config: loaded {} (enabled={})", kConfigPath, enabled);
 	}
 
 	void Config::Save() const

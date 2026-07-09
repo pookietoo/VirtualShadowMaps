@@ -8,7 +8,7 @@
 
 // Exposes our shadow atlas + per-light buffer + sampler to Community Shaders'
 // LightLimitFix::Prepass, which binds them (t110/t111/s7) so the lighting shader can sample
-// our shadows. Phase 3.
+// our shadows.
 extern "C" DLLEXPORT void VSM_GetShadowResources(
     ID3D11ShaderResourceView** a_atlas,
     ID3D11ShaderResourceView** a_lightBuffer,
@@ -39,6 +39,7 @@ namespace
 	using PresentFn = HRESULT(WINAPI*)(IDXGISwapChain*, UINT, UINT);
 	PresentFn g_origPresent = nullptr;
 
+#if VSM_DIAGNOSTICS
 	// ---- ID3D11DeviceContext::OMSetRenderTargets hook (vtable index 33) — binds our pixel-probe UAV
 	// at u8 alongside whatever render targets a pass sets, ONLY while the probe is armed. This lets
 	// the real Lighting.hlsl write its per-pixel probe. When disarmed it's a pure passthrough. ----
@@ -75,8 +76,9 @@ namespace
 		g_origOMSetRTs = reinterpret_cast<OMSetRTsFn>(vtbl[33]);
 		vtbl[33] = reinterpret_cast<void*>(&HookedOMSetRenderTargets);
 		VirtualProtect(&vtbl[33], sizeof(void*), oldProtect, &oldProtect);
-		logger::info("VSM: OMSetRenderTargets hook installed (real-shader pixel probe, u8)");
+		VSM_LOG("VSM: OMSetRenderTargets hook installed (real-shader pixel probe, u8)");
 	}
+#endif  // VSM_DIAGNOSTICS
 
 	// Draw callback CS invokes inside its menu (registered via CS_RegisterExternalMenu).
 	void ExternalDrawMenu()
@@ -112,7 +114,7 @@ namespace
 		ImGui::SetAllocatorFunctions(alloc, free, ud);
 		reg(&ExternalDrawMenu);
 		done = true;
-		logger::info("VSM: registered menu with Community Shaders");
+		VSM_LOG("VSM: registered menu with Community Shaders");
 	}
 
 	HRESULT WINAPI HookedPresent(IDXGISwapChain* a_this, UINT a_sync, UINT a_flags)
@@ -132,7 +134,7 @@ namespace
 		g_origPresent = reinterpret_cast<PresentFn>(vtbl[8]);
 		vtbl[8] = reinterpret_cast<void*>(&HookedPresent);
 		VirtualProtect(&vtbl[8], sizeof(void*), oldProtect, &oldProtect);
-		logger::info("VSM: Present hook installed");
+		VSM_LOG("VSM: Present hook installed");
 	}
 
 	void InitializeLog()
@@ -163,21 +165,31 @@ namespace
 		auto* device = reinterpret_cast<ID3D11Device*>(rd.forwarder);
 		auto* context = reinterpret_cast<ID3D11DeviceContext*>(rd.context);
 		auto* swapChain = reinterpret_cast<IDXGISwapChain*>(rd.renderWindows->swapChain);
-		logger::info("VSM: D3D device={} context={} swapChain={}",
+		VSM_LOG("VSM: D3D device={} context={} swapChain={}",
 		    (void*)device, (void*)context, (void*)swapChain);
+
+		if (swapChain) {
+			DXGI_SWAP_CHAIN_DESC scd{};
+			if (SUCCEEDED(swapChain->GetDesc(&scd))) {
+				VirtualShadowMaps::GetSingleton()->SetRenderSize(scd.BufferDesc.Width, scd.BufferDesc.Height);
+				VSM_LOG("VSM: render size {}x{} (pixel-probe target = centre)", scd.BufferDesc.Width, scd.BufferDesc.Height);
+			}
+		}
 
 		VirtualShadowMaps::GetSingleton()->OnD3DReady(device, context);
 		InstallPresentHook(swapChain);
+#if VSM_DIAGNOSTICS
 		InstallContextHook(context);  // for the real-shader pixel probe (only acts while armed)
+#endif
 
-		logger::info("VSM: ready. Settings appear in the Community Shaders menu under 'Virtual Shadow Maps'.");
+		VSM_LOG("VSM: ready. Settings appear in the Community Shaders menu under 'Virtual Shadow Maps'.");
 	}
 }
 
 extern "C" DLLEXPORT bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
 {
 	InitializeLog();
-	logger::info("Loaded {} {}", Plugin::NAME, Plugin::VERSION);
+	VSM_LOG("Loaded {} {}", Plugin::NAME, Plugin::VERSION);
 	SKSE::Init(a_skse);
 	SKSE::AllocTrampoline(1 << 10);
 	SKSE::GetMessagingInterface()->RegisterListener("SKSE", MessageHandler);

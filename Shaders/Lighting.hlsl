@@ -11,6 +11,8 @@
 #include "Common/Shading.hlsli"
 #include "Common/SharedData.hlsli"
 #include "VirtualShadowMaps/VSM.hlsli"  // Virtual Shadow Maps add-on (samples our shadow atlas)
+// VSM include rev: 0.9.50 (bump this when VSM.hlsli changes so CS recompiles Lighting.hlsl — its
+// shader cache keys on THIS file, not the include, so an include-only edit wouldn't take effect).
 #include "Common/Skinned.hlsli"
 #include "Common/Triplanar.hlsli"
 
@@ -2684,7 +2686,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float3 lightColor = Color::PointLight(PointLightColor[lightIndex].xyz) * intensityMultiplier;
 		// VSM: engine's 4-slot local shadow mask stays bypassed; only OUR atlas shadows local lights.
 		float lightShadow = 1.f;
-		lightShadow *= VSM::GetLocalShadow(PointLightPosition[lightIndex].xyz, input.WorldPosition.xyz, input.Position.xy);
+		lightShadow *= VSM::GetLocalShadow(PointLightPosition[lightIndex].xyz, input.WorldPosition.xyz, input.Position.xy, worldNormal);
 
 		float3 normalizedLightDirection = normalize(lightDirection);
 
@@ -2766,7 +2768,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
 		float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * light.fade;
 		float lightShadow = 1.0;
-		lightShadow *= VSM::GetLocalShadow(light.positionWS.xyz, input.WorldPosition.xyz, input.Position.xy);
+		lightShadow *= VSM::GetLocalShadow(light.positionWS.xyz, input.WorldPosition.xyz, input.Position.xy, worldNormal);
 
 		// VSM: engine's 4-slot local shadow mask stays bypassed; only OUR atlas shadows local
 		// lights. shadowComponent stays 1.0 so the parallax self-shadow gate below still behaves.
@@ -3388,7 +3390,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #	endif
 
-	[branch] if (VSM::WantsDebugOverride())  // VSM diagnostic: paint a pipeline stage as RGB (menu Mode >= 2)
+	[branch] if (VSM::WantsShadowTint())  // VSM: repaint OUR shadows by their source (menu Mode 23=light, 24=face)
+		psout.Diffuse.xyz = VSM::ShadowTint(psout.Diffuse.xyz);
+	else [branch] if (VSM::WantsDebugOverride())  // VSM diagnostic: paint a pipeline stage as RGB (menu Mode >= 2)
 		psout.Diffuse.xyz = VSM::DebugColor(input.WorldPosition.xyz);
 	return psout;
 }
