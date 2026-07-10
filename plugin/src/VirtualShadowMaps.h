@@ -179,6 +179,12 @@ private:
 	ComPtr<ID3D11DepthStencilView>   staticDsv;
 	bool staticCacheValid      = false;   // false -> re-bake static casters into staticDepthTex next frame
 	int  lastBakedRegistrySize = -1;      // registry size at last bake (a size change ~ cell change -> invalidate)
+	// P2 pose-freeze: while the cache HOLDS, the shader must sample it with the EXACT pose it was baked with,
+	// or a sub-threshold light jitter (fire flicker) smears the cached static shadow. Snapshot each light's
+	// baked cube VP + position; on hold frames restore them into lightRecords before upload/render.
+	struct BakedPose { DirectX::XMFLOAT4X4 cubeVP[6]; DirectX::XMFLOAT3 pos; };
+	std::unordered_map<const void*, BakedPose> bakedPose;   // BSLight* -> pose the static cache was baked with
+	void UpdateStaticCacheState();        // after PackAtlas, before upload: finalize invalidation + freeze poses if holding
 	ComPtr<ID3D11VertexShader>       depthVS;
 	ComPtr<ID3D11InputLayout>        ilFull;    // POSITION R32G32B32_FLOAT (always; see RebuildRegistry)
 	// Occluder-id atlas: R32_UINT target rasterized alongside depth. Each draw writes (registryIndex+1);
@@ -400,6 +406,12 @@ private:
 	std::unordered_map<std::uint64_t, std::vector<std::pair<int, int>>> freeSlots;    // (w<<32|h) -> freed (x,y) origins, reused same-size
 	int           atlasBumpX = 0, atlasBumpY = 0, atlasBumpRowH = 0;    // shelf-bump cursor for NEW slots (pixels)
 	std::uint64_t atlasFrame = 0;                                        // per-PackAtlas tick, drives LRU eviction
+	// Collection DEBOUNCE (anti-flicker): the engine rotates which lights are IsShadowLight()/activeShadowLights
+	// every RENDER frame (even when paused), churning our collected set -> shadows blink. Keep a light shadowed
+	// for a GRACE window after it last appeared, re-adding recently-seen lights that dropped out this frame.
+	struct CachedLight { LightRecord rec; std::uint64_t lastSeen; };
+	std::unordered_map<const void*, CachedLight> recentLights;   // BSLight* -> last collected record + last-seen frame
+	std::uint64_t collectFrame = 0;                              // per-CollectLights tick, drives the grace window
 	DirectX::XMFLOAT3              prevSceneCameraPos{};
 	bool                           havePrevSceneCam    = false;
 	float                          cameraMovedThisFrame = 0.0f;  // |cameraPos - prevCameraPos| this frame (world units)

@@ -13,6 +13,7 @@
 #include <format>
 #include <limits>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 // Path B (skinned characters): read skin partitions + the engine bone-matrix palette, CPU-skin, render.
@@ -604,6 +605,7 @@ void VirtualShadowMaps::PackAtlas()
 		} else {
 			if (it != lightSlots.end()) { releaseSlot(it->second); lightSlots.erase(it); }  // tier changed -> free old block
 			it = lightSlots.emplace(id, allocSlot(bw, bh, fr)).first;
+			staticCacheValid = false;   // P2: a new/moved slot -> any baked static for this light is now in the wrong block
 		}
 		lightRecords[i].atlasX = static_cast<float>(it->second.x);
 		lightRecords[i].atlasY = static_cast<float>(it->second.y);
@@ -624,6 +626,31 @@ void VirtualShadowMaps::PackAtlas()
 		else
 			VSM_LOG("VSM: atlas grown to {}x{} (~{}MB); {} stable light slots", rtAtlasW, rtAtlasH,
 			    (static_cast<std::int64_t>(rtAtlasW) * rtAtlasH * static_cast<std::int64_t>(sizeof(float))) / kBytesPerMB, lightSlots.size());
+	}
+}
+
+// Finalize the P2 static-cache invalidation and, if the cache HOLDS this frame, FREEZE each light's pose to
+// the snapshot the cache was baked with — so the shader samples the held atlas with the EXACT baking pose. A
+// sub-threshold light jitter (fire flicker, moveThisFrame < kLightMoveEps) would otherwise smear the cached
+// static shadow (the reported "pulsing from the fire"). Runs after PackAtlas, before UploadLightBuffer.
+void VirtualShadowMaps::UpdateStaticCacheState()
+{
+	if (!vsm::GetConfig().cacheStaticShadows)
+		return;
+	if (lastBakedRegistrySize >= 0 && static_cast<int>(registry.size()) != lastBakedRegistrySize)
+		staticCacheValid = false;   // caster-count change ~ cell change
+	if (!staticCacheValid)
+		return;                     // will re-bake in RenderDepth with the CURRENT poses -> nothing to freeze
+	for (size_t i = 0; i < lightRecords.size(); ++i) {
+		const void* id = (i < lightPtrs.size()) ? lightPtrs[i] : nullptr;
+		const auto it = bakedPose.find(id);
+		if (it == bakedPose.end())
+			continue;
+		for (int f = 0; f < 6; ++f)
+			lightRecords[i].cubeVP[f] = it->second.cubeVP[f];
+		lightRecords[i].positionWS.x = it->second.pos.x;   // keep positionWS.w (faceRes; a tier change already invalidated)
+		lightRecords[i].positionWS.y = it->second.pos.y;
+		lightRecords[i].positionWS.z = it->second.pos.z;
 	}
 }
 
@@ -797,6 +824,38 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 	for (auto& lightPtr : rt.activeShadowLights) {  // shadow-casters the engine tracks separately
 		if (!addLight(lightPtr.get()))
 			break;
+	}
+
+	// --- Collection DEBOUNCE (anti-flicker) ---
+	// The engine rotates which lights are IsShadowLight()/activeShadowLights each RENDER frame — even when the
+	// game is paused (console) — so our collected set churns 5<->8 and shadows blink on/off. Keep each light
+	// shadowed for a GRACE window: refresh the cache for lights collected this frame, then RE-ADD any recently
+	// seen light that dropped out this frame (using its cached record). This stabilizes the set to the UNION of
+	// recently-active shadow lights — which is exactly the mod's goal ("shadow the lights the engine dropped").
+	++collectFrame;
+	{
+		std::unordered_set<const void*> present;
+		present.reserve(lightRecords.size() * 2u + 1u);
+		for (size_t i = 0; i < lightRecords.size(); ++i) {
+			present.insert(lightPtrs[i]);
+			recentLights[lightPtrs[i]] = { lightRecords[i], collectFrame };
+		}
+		for (auto it = recentLights.begin(); it != recentLights.end();) {
+			if (collectFrame - it->second.lastSeen > vsm::kLightGraceFrames) {
+				it = recentLights.erase(it);                       // gone too long -> forget
+			} else {
+				if (!present.count(it->first)) {                   // seen recently but missing now -> re-add (bridge the rotation)
+					lightRecords.push_back(it->second.rec);
+					lightPtrs.push_back(it->first);
+					lightNames.emplace_back();
+					lightOwnerRef.push_back(0);
+					lightNodeRef.push_back(0);
+					lightMeta.emplace_back();
+					lightDynamic.push_back(0);
+				}
+				++it;
+			}
+		}
 	}
 	activeLightCount = static_cast<int>(lightRecords.size());
 
@@ -1675,9 +1734,7 @@ void VirtualShadowMaps::RenderDepth()
 		return;
 	}
 
-	// --- P2 ON: static/dynamic caching. ---
-	if (static_cast<int>(registry.size()) != lastBakedRegistrySize)   // a caster-count change ~ cell change
-		staticCacheValid = false;
+	// --- P2 ON: static/dynamic caching. (Invalidation + pose-freeze were finalized in UpdateStaticCacheState.) ---
 	if (!haveTestLight || registry.empty()) {
 		context->OMSetRenderTargets(1, &rtvBind, dsv.Get());
 		context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, clearZ, 0);   // don't freeze the preview
@@ -1693,7 +1750,16 @@ void VirtualShadowMaps::RenderDepth()
 		RenderCasterPass(1, false);                                  // static casters only, no skinned
 		staticCacheValid      = true;
 		lastBakedRegistrySize = static_cast<int>(registry.size());
-		VSM_LOG("VSM P2: re-baked static cache ({} registry casters, {} lights) — cache HOLDS until a light moves/appears or the cell changes", registry.size(), lightRecords.size());
+		// Snapshot the poses this bake used, so future cache-HOLD frames sample the atlas with the SAME pose
+		// (UpdateStaticCacheState restores these) — otherwise a sub-threshold light jitter smears the shadow.
+		bakedPose.clear();
+		for (size_t i = 0; i < lightRecords.size(); ++i) {
+			BakedPose bp;
+			for (int f = 0; f < 6; ++f) bp.cubeVP[f] = lightRecords[i].cubeVP[f];
+			bp.pos = { lightRecords[i].positionWS.x, lightRecords[i].positionWS.y, lightRecords[i].positionWS.z };
+			bakedPose[(i < lightPtrs.size()) ? lightPtrs[i] : nullptr] = bp;
+		}
+		VSM_LOG("VSM P2: re-baked static cache ({} registry casters, {} lights) — cache HOLDS + pose FROZEN until a light moves/appears or the cell changes", registry.size(), lightRecords.size());
 	}
 
 	// COMPOSITE: live atlas <- cached static depth (single whole-resource copy; legal for depth). Unbind the
@@ -1748,6 +1814,7 @@ void VirtualShadowMaps::RenderFrame()
 
 	CollectLights(ssn);      // gather all active local lights -> lightRecords + assign atlas blocks
 	PackAtlas();                    // assign each light's variable-res block origin + grow the atlas to fit
+	UpdateStaticCacheState();       // P2: finalize static-cache invalidation + freeze poses if the cache holds
 	EnsureLightBuffer(activeLightCount);  // grow the per-light GPU buffer to fit ALL active lights — no cap
 	BuildCasterBounds();     // per-caster frustum spheres, in the draw's absolute space
 #if VSM_DIAGNOSTICS
