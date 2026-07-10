@@ -36,6 +36,13 @@ namespace
 		    "# Performance: cull shadow lights that are behind the camera or entirely beyond fShadowDistance\n"
 		    "# (they cast no visible shadow). Conservative. Default false (module under validation).\n"
 		    "cullCasters = {}\n"
+		    "# Performance (P4, requires cacheStaticShadows): per-light cache invalidation + budgeted re-bakes —\n"
+		    "# only the light whose static occluders changed re-renders its block, amortized across frames.\n"
+		    "# Default false (module under validation).\n"
+		    "incrementalCache = {}\n"
+		    "# Colored translucent shadows: glass / alpha-blended casters dim and tint the light passing through\n"
+		    "# them (instead of being excluded). Adds a transmittance atlas. Default false (module under validation).\n"
+		    "translucentShadows = {}\n"
 		    "\n"
 		    "# [atlas] is COMPILE-TIME (baked into the shipped shader + GPU buffer sizing). Shown for\n"
 		    "# reference only; changing it here has NO effect until the plugin is rebuilt with new\n"
@@ -47,6 +54,8 @@ namespace
 		    c.qualityFactor,
 		    c.cacheStaticShadows,
 		    c.cullCasters,
+		    c.incrementalCache,
+		    c.translucentShadows,
 		    vsm::kFaceRes, vsm::kMaxLights);
 	}
 }
@@ -80,6 +89,8 @@ namespace vsm
 		qualityFactor      = tbl["general"]["qualityFactor"].value_or(qualityFactor);
 		cacheStaticShadows = tbl["general"]["cacheStaticShadows"].value_or(cacheStaticShadows);
 		cullCasters        = tbl["general"]["cullCasters"].value_or(cullCasters);
+		incrementalCache   = tbl["general"]["incrementalCache"].value_or(incrementalCache);
+		translucentShadows = tbl["general"]["translucentShadows"].value_or(translucentShadows);
 
 		// Atlas geometry is compile-time; warn (don't apply) if the file disagrees.
 		const int faceRes   = tbl["atlas"]["faceResolution"].value_or(kFaceRes);

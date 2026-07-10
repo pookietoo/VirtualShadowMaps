@@ -33,6 +33,16 @@ extern "C" DLLEXPORT void VSM_GetShadowResources(
 		*a_enabled = vsm->IsEnabled();
 }
 
+// A5 (colored translucent shadows): the transmittance atlas SRV, bound by LightLimitFix::Prepass at t112. Kept as a
+// SEPARATE export (not appended to VSM_GetShadowResources) so the original 6-arg contract is unchanged — an older CS
+// that never calls this simply doesn't bind t112, and there is no calling-convention mismatch. Always non-null once
+// resources are ready (the atlas is cleared white when the A5 module is off, so binding it is a no-op then).
+extern "C" DLLEXPORT void VSM_GetTransmittanceResource(ID3D11ShaderResourceView** a_transAtlas)
+{
+	if (a_transAtlas)
+		*a_transAtlas = VirtualShadowMaps::GetSingleton()->GetTransmittanceSRV();
+}
+
 namespace
 {
 	// ---- IDXGISwapChain::Present hook (vtable index 8) — our per-frame tick ----

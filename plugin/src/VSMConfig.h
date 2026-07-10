@@ -19,6 +19,10 @@ namespace vsm
 		float qualityFactor = 1.0f;   // k: target shadow texels per screen pixel (variable-res level picker); 1 = critically sampled
 		bool  cacheStaticShadows = false;  // P2 module (default OFF): cache static-geometry depth, re-render only dynamics each frame
 		bool  cullCasters        = false;  // P3 module (default OFF): drop lights behind the camera / beyond fShadowDistance (no visible shadow)
+		bool  incrementalCache   = false;  // P4 module (default OFF; requires cacheStaticShadows): per-light cache invalidation +
+		                                   // budgeted re-bakes (only the dirty light's block re-renders), instead of P2's whole-cache rebuild
+		bool  translucentShadows = false;  // A5 module (default OFF): colored translucent shadows — glass/alpha casters dim + tint the
+		                                   // light passing through (transmittance atlas at t112), instead of being excluded entirely
 
 		// Read the .toml (writing a documented default file if none exists) and validate the
 		// [atlas] section against the compiled constants. Safe to call once at startup.

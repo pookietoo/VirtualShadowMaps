@@ -24,12 +24,17 @@ Verified working in-game:
 - **In-menu UI** — the settings panel renders inside the Community Shaders menu.
 
 Opt-in performance modules (default **off**, toggled live in the menu) — static/dynamic shadow
-caching and off-screen light culling. Enable them to trade a little accuracy for speed once you've
-confirmed the baseline looks right.
+caching (with an optional per-light *incremental* re-bake), and off-screen light culling. Enable them
+to trade a little accuracy for speed once you've confirmed the baseline looks right.
 
-Only opaque, solid, camera-independent geometry casts; billboards, transparent/effect surfaces,
-decals, and engine "does not cast" meshes are excluded. Translucent/alpha shadowing (tinted light
-through stained glass, etc.), radius-edge fade, and head/hair skinned meshes are not yet done.
+Newer modules, **implemented but not yet validated in-game** (treat as experimental): a far-distance
+fade that softens a shadow toward the edge of its light's radius, and **colored translucent shadows**
+(default off) — glass / alpha-blended surfaces dim and tint the light passing through them instead of
+being excluded. The translucent module additionally needs the matching Community Shaders build (see
+below).
+
+Only opaque, solid, camera-independent geometry is treated as a hard occluder; billboards,
+decals, and engine "does not cast" meshes are excluded, and head/hair skinned meshes don't yet cast.
 
 ## Building
 

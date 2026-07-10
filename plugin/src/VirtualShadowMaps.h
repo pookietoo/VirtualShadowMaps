@@ -22,6 +22,7 @@
 
 #include <DirectXMath.h>
 #include <d3d11.h>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -50,6 +51,7 @@ public:
 	// Exposed to Plugin.cpp's C exports so LLF's shader can sample our shadows.
 	ID3D11ShaderResourceView* GetAtlasSRV() const { return srv.Get(); }
 	ID3D11ShaderResourceView* GetLightBufferSRV() const { return lightBufferSRV.Get(); }
+	ID3D11ShaderResourceView* GetTransmittanceSRV() const { return transSRV.Get(); }  // A5: colored transmittance atlas (t112)
 	ID3D11SamplerState*       GetPointSampler() const { return pointSampler.Get(); }
 	ID3D11Buffer*             GetDebugCB() const { return debugCB.Get(); }
 	int  GetShadowLightCount() const { return static_cast<int>(lightRecords.size()); }
@@ -119,6 +121,11 @@ private:
 		bool                          isStatic     = false;  // R5 classification: STATIC = never moves (base Static/
 		                                                     // StaticCollection, not skinned, no anim controller) ->
 		                                                     // safe to CACHE once (P2). Else DYNAMIC (err this way).
+		bool                          isTranslucent = false; // A5: glass / alpha-blended caster. Rendered into the
+		                                                     // TRANSMITTANCE atlas (dims/tints the light), never the
+		                                                     // opaque depth atlas. Skipped by every depth pass.
+		float                         transR = 1.0f, transG = 1.0f, transB = 1.0f;  // A5 per-channel transmittance
+		                                                     // (1 = clear) = 1 - coverage*(1 - materialTint); what fraction of each light channel passes
 	};
 
 	// One record per shadow-casting light, uploaded to a GPU buffer so the LLF shader
@@ -164,6 +171,18 @@ private:
 	bool CreateStaticCacheResources();  // (re)create staticDepthTex + staticDsv at rtAtlasW x rtAtlasH (P2)
 	bool EnsureStaticCache();           // lazily create the static cache when cacheStaticShadows is on; false if unavailable
 	void RenderCasterPass(int a_filter, bool a_drawSkinned);  // draw casters into the BOUND dsv/viewport; filter 0=all 1=static 2=dynamic
+	void BakeOneLightStatic(size_t a_lightIdx);   // P4: clear + re-render ONE light's static block into the static cache (staticDsv bound by caller)
+	void RenderTranslucentPass();                 // A5: render glass/alpha casters into the transmittance atlas (multiplicative, depth-tested vs opaque)
+	// Iterate one light's 6 cube faces: bind each face's atlas viewport and hand the body the face's view-proj +
+	// world-space frustum planes. The block/face/viewport/plane math lives ONLY here, shared by every atlas pass
+	// (opaque depth, P4 static bake, A5 translucent). planes points to a temporary 6-element array valid for the call.
+	void ForEachLightFace(const LightRecord& a_light,
+	    const std::function<void(const DirectX::XMMATRIX& a_faceVP, const DirectX::XMFLOAT4* a_planes)>& a_body);
+	// Shared tail of every caster draw: push the per-draw cbuffer (WVP, id, transmittance), bind the caster's
+	// vertex/index buffers, issue the indexed draw. Caller has set the pass pipeline + per-caster raster and
+	// validated the buffers; a_transmittance is used only by the A5 pass (ignored by the depth/id shaders).
+	void EmitCasterDraw(size_t a_i, ID3D11Buffer* a_vb, ID3D11Buffer* a_ib,
+	    const DirectX::XMMATRIX& a_wvp, const DirectX::XMFLOAT4& a_transmittance);
 	bool CreateLightBufferResources(int cap);  // (re)create the per-light structured buffer + SRV at cap elements
 	void EnsureLightBuffer(int nLights);        // grow the per-light buffer to fit ALL active lights (no cap)
 	int  lightBufCapacity = vsm::kMaxLights;    // current element capacity of lightBuffer (grows on demand)
@@ -172,6 +191,18 @@ private:
 	ComPtr<ID3D11Texture2D>          depthTex;
 	ComPtr<ID3D11DepthStencilView>   dsv;
 	ComPtr<ID3D11ShaderResourceView> srv;
+	// A5 colored translucent shadows (config.translucentShadows): an RGBA transmittance atlas, SAME layout/size as the
+	// depth atlas. Glass/alpha casters render into it with a MULTIPLICATIVE, order-independent blend (dst=dst*src);
+	// LLF samples it at t112 and multiplies the local light. ALWAYS created + cleared white each frame, so when A5 is
+	// OFF the shader path is a no-op multiply by white. dsvReadOnly lets the glass depth-test vs the opaque atlas.
+	ComPtr<ID3D11Texture2D>          transTex;
+	ComPtr<ID3D11RenderTargetView>   transRTV;
+	ComPtr<ID3D11ShaderResourceView> transSRV;
+	ComPtr<ID3D11DepthStencilView>   dsvReadOnly;         // read-only DSV of depthTex — glass tests vs the opaque atlas, no depth write
+	ComPtr<ID3D11BlendState>         multiplyBlend;       // dst = dst * src (order-independent transmittance accumulation)
+	ComPtr<ID3D11DepthStencilState>  depthReadOnlyState;  // GREATER, depth-write OFF (glass tests vs opaque; layered glass all contributes)
+	ComPtr<ID3D11PixelShader>        transPS;             // outputs the per-caster transmittance color from PerDrawCB
+	ComPtr<ID3D11DepthStencilState>  depthClearState;     // P4: ALWAYS + depth-write, for the per-block far-Z clear (fullscreen triangle)
 	// P2 static/dynamic caching (config.cacheStaticShadows): a STATIC-only depth cache (ours, NOT sampled by
 	// LLF). Each frame: bake static casters into it ONLY when invalidated, then live atlas = CopyResource(cache)
 	// + DYNAMIC casters rendered over it -> LLF samples the SAME single t110 atlas (shader unchanged, no CS fork).
@@ -184,7 +215,15 @@ private:
 	// baked cube VP + position; on hold frames restore them into lightRecords before upload/render.
 	struct BakedPose { DirectX::XMFLOAT4X4 cubeVP[6]; DirectX::XMFLOAT3 pos; };
 	std::unordered_map<const void*, BakedPose> bakedPose;   // BSLight* -> pose the static cache was baked with
+	// P4 incremental cache (config.incrementalCache, requires cacheStaticShadows): per-light dirty set. A light is
+	// dirty on first appearance, slot/tier change (PackAtlas), movement > kLightMoveEps, or a static-caster-set change.
+	// Only dirty lights re-bake — new ones immediately, moved ones budgeted at kMaxRebakesPerFrame — while every clean
+	// light keeps its cached block (bakedPose presence = "has a valid baked static block"). Replaces P2's whole-cache rebuild.
+	std::unordered_set<const void*> dirtyLights;            // BSLight* needing a static re-bake
+	int lastStaticCasterCount = -1;                         // static-caster count at last incremental sync (a change ~ cell change -> invalidate all)
+	std::vector<std::size_t> bakeThisFrame;                 // P4: light indices selected to re-bake this frame (chosen in UpdateStaticCacheState, consumed by RenderDepth)
 	void UpdateStaticCacheState();        // after PackAtlas, before upload: finalize invalidation + freeze poses if holding
+	void PoseFreezeLight(size_t a_i, const BakedPose& a_bp);  // restore one held light's cube VPs + pos from its baked snapshot (keeps faceRes)
 	ComPtr<ID3D11VertexShader>       depthVS;
 	ComPtr<ID3D11InputLayout>        ilFull;    // POSITION R32G32B32_FLOAT (always; see RebuildRegistry)
 	// Occluder-id atlas: R32_UINT target rasterized alongside depth. Each draw writes (registryIndex+1);
@@ -225,6 +264,7 @@ private:
 	// members directly; only the per-iteration values are parameters.
 	void DrawStaticCaster(size_t i, DirectX::FXMMATRIX faceVP, const DirectX::XMFLOAT4 planes[6], bool blinkOff);
 	void DrawSkinnedRange(const SkinnedRange& r, DirectX::FXMMATRIX faceVP, const DirectX::XMFLOAT4 planes[6], bool blinkOff);
+	void DrawTranslucentCaster(size_t i, DirectX::FXMMATRIX faceVP, const DirectX::XMFLOAT4 planes[6]);  // A5: one glass caster -> transmittance atlas
 
 	std::vector<DirectX::XMFLOAT3>  skinPosed;    // CPU scratch: world-absolute posed positions
 	std::vector<std::uint32_t>      skinIndices;  // CPU scratch: 32-bit indices into skinPosed

@@ -19,11 +19,13 @@ namespace vsm
 	// Every active light gets a 3x2 cube-face "block"; blocks tile the atlas in a grid.
 	// Correctness-first: modest per-face resolution + a light cap. Both scale up once the
 	// culling/paging work (Phase 2) lands.
-	inline constexpr int kFaceRes      = 256;              // one cube face, in texels
-	inline constexpr int kMaxLights    = 32;              // INITIAL light-buffer + atlas capacity (BOTH grow on demand via EnsureLightBuffer/PackAtlas — NOT a hard cap on shadow lights)
-	inline constexpr int kLightsPerRow = 4;               // light-blocks per atlas row
-	inline constexpr int kBlockW       = kFaceRes * 3;    // 768: three faces (+X -X +Y) wide
-	inline constexpr int kBlockH       = kFaceRes * 2;    // 512: two faces (-Y +Z -Z) tall
+	inline constexpr int kFaceRes       = 256;             // one cube face, in texels
+	inline constexpr int kMaxLights     = 32;             // INITIAL light-buffer + atlas capacity (BOTH grow on demand via EnsureLightBuffer/PackAtlas — NOT a hard cap on shadow lights)
+	inline constexpr int kLightsPerRow  = 4;              // light-blocks per atlas row
+	inline constexpr int kCubeFacesWide = 3;              // a light's cube-face block is 3 faces wide (+X -X +Y)...
+	inline constexpr int kCubeFacesTall = 2;              // ...and 2 faces tall (-Y +Z -Z) — one 3x2 block per light
+	inline constexpr int kBlockW        = kFaceRes * kCubeFacesWide;   // 768: three faces wide
+	inline constexpr int kBlockH        = kFaceRes * kCubeFacesTall;   // 512: two faces tall
 	inline constexpr int kAtlasW       = kLightsPerRow * kBlockW;                                       // 3072
 	inline constexpr int kAtlasH       = ((kMaxLights + kLightsPerRow - 1) / kLightsPerRow) * kBlockH;  // 4096
 
@@ -51,6 +53,8 @@ namespace vsm
 	inline constexpr std::uint64_t kSlotEvictFrames    = 90;    // free a light's persistent atlas slot after this many frames unseen (LRU)
 	inline constexpr float         kLightMoveEps       = 0.5f;  // world-units a collected light must move to invalidate the P2 static cache
 	inline constexpr std::uint64_t kLightGraceFrames   = 30;    // keep a light shadowed this many frames after it last appeared (anti-flicker debounce)
+	inline constexpr int           kMaxRebakesPerFrame = 2;     // P4: max MOVED lights whose static cache re-bakes per frame (new lights bypass this) — amortizes re-bake cost
+	inline constexpr float         kTranslucentCoverage = 0.5f; // A5: default per-glass opacity when the material alpha can't be read (0 = clear .. 1 = opaque tint)
 	inline constexpr std::size_t   kMaxCasters         = 8192;  // registry hard cap (huge-cell / runaway guard)
 	inline constexpr int           kMaxSceneGraphDepth = 64;    // recursion-depth guard for RebuildRegistry's scene-graph traversal (cycle guard)
 

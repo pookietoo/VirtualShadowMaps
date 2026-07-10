@@ -20,6 +20,8 @@ namespace VSM
 	static const float kOutOfCubeNdc = 9.0;  // ndc sentinel value meaning "no valid projection" (out of cube / behind)
 	static const float kDivEps      = 1e-4;  // near-zero divide / behind-light guard
 	static const float kArgMinInit  = 1e30;  // initial best-distance for the nearest-light argmin
+		static const float kRadiusFadeBand = 0.12;  // A1: fade the shadow toward lit over the outer 12% of the light's radius (far
+		                                            // plane), so it vanishes with the light's own falloff instead of a hard circular cutoff.
 	static const int   kMaxPCFRadius = 4;    // clamp cap for the runtime soft-shadow PCF half-width (gPCFRadius, from
 	                                         // iBlurDeferredShadowMask). Fixed texels x per-light faceRes = constant screen penumbra.
 
@@ -36,6 +38,10 @@ namespace VSM
 	Texture2D<float>              ShadowAtlas   : register(t110);
 	StructuredBuffer<LightRecord> ShadowLights  : register(t111);
 	SamplerState                  ShadowSampler : register(s7);
+	// A5 colored translucent shadows: per-texel transmittance of glass / alpha-blended casters in front of the
+	// nearest opaque occluder. 1 = clear (no effect). Bound at t112 by LightLimitFix::Prepass (VirtualShadowMaps.dll).
+	// ALWAYS bound and cleared white by the plugin, so when the A5 module is OFF this sample is a no-op multiply by 1.
+	Texture2D<float4>             ShadowTransAtlas : register(t112);
 
 	// Live tuning from the plugin menu (VirtualShadowMaps.cpp::UpdateDebugCB), bound at b13 by
 	// LightLimitFix::Prepass. 64-byte layout = four float4 rows; MUST match the C++ struct (static_assert).
@@ -169,8 +175,9 @@ namespace VSM
 	// pixelPos = SV_Position.xy (screen pixels), used only to select the probe target pixel.
 	// Restructured to a single exit so the armed probe can capture the FULL state (incl. the reason
 	// a pixel came back lit) — the returned shadow value is identical to the original branch logic.
-	float GetLocalShadow(float3 lightPosWS, float3 P, float2 pixelPos, float3 worldNormal)
+	float GetLocalShadow(float3 lightPosWS, float3 P, float2 pixelPos, float3 worldNormal, out float3 transmittance)
 	{
+		transmittance = float3(1.0, 1.0, 1.0);  // A5: default clear (white) — set from the transmittance atlas once a light is matched
 		// Probe targets the centre pixel; the probe centre is supplied by C++ as gProbePixelX/Y (already in
 		// SV_Position space), so no in-shader resolution math is needed.
 		bool isTarget = false;
@@ -233,6 +240,9 @@ namespace VSM
 						float2 pxc    = float2(L.atlasX, L.atlasY) + (tile + faceUV) * faceRes;  // atlasX/Y = block pixel origin
 						atlasUV       = pxc / float2(gAtlasW, gAtlasH);
 						occluder      = ShadowAtlas.SampleLevel(ShadowSampler, atlasUV, 0);
+						// A5: colored transmittance of any glass/alpha caster in front of the opaque occluder along this
+						// texel's ray (white when the A5 module is off). Multiplies the local light in Lighting.hlsl.
+						transmittance = ShadowTransAtlas.SampleLevel(ShadowSampler, atlasUV, 0).rgb;
 						if (gCompareMode == 1) {
 							shadow = (occluder - ndc.z > 0.0) ? 0.0 : 1.0;   // raw compare (isolates linearize); reverse-Z: occluder nearer (larger z) than receiver = shadowed
 						} else {
@@ -267,6 +277,11 @@ namespace VSM
 									cnt += 1.0;
 								}
 							shadow = sum / cnt;  // 0=shadowed .. 1=lit (fractional=penumbra); pr=0 -> single tap (hard)
+							// A1 far-distance fade: as the receiver nears the light's max reach (farPlane = radius), lift the
+							// shadow toward lit so it disappears in step with the light's own radiometric falloff — removes the
+							// hard circular cutoff where the atlas runs out of depth. Confined to the outer band (light ~0 there).
+							float fadeA1 = saturate((L.farPlane - linPix) / max(L.farPlane * kRadiusFadeBand, kDivEps));
+							shadow = lerp(1.0, shadow, fadeA1);
 						}
 						// Tint modes: record what shadowed this pixel so Lighting.hlsl can paint it.
 						if ((gMode == 23 || gMode == 24 || gMode == 25) && shadow < 0.5) {

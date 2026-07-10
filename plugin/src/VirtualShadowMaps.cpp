@@ -29,6 +29,7 @@
 #include "RE/T/TESObjectLIGH.h"         // OBJ_LIGH: nearDistance, flags (shadow type), color, radius
 #include "RE/B/BSShaderProperty.h"      // EShaderPropertyFlag::kCastShadows — mirror the engine's cast flag
 #include "RE/B/BSEffectShaderProperty.h"// effect-shader geometry (emitters/FX) — not an opaque caster
+#include "RE/B/BSEffectShaderMaterial.h"// A5: effect-glass baseColor (NiColorA tint + alpha) for translucent shadow tint
 #include "RE/P/PlayerCharacter.h"       // player 3D root (viewer-attached light rejection)
 #include "RE/P/PlayerCamera.h"          // camera root (viewer-attached light rejection)
 
@@ -73,6 +74,14 @@ cbuffer PerDrawCB : register(b0) { row_major float4x4 WorldViewProj; uint Caster
 uint main(float4 pos : SV_Position) : SV_Target { return CasterId; }
 )";
 
+	// A5 transmittance PS: outputs the per-caster colored transmittance (from PerDrawCB, offset 80) into the RGBA
+	// transmittance atlas under a MULTIPLICATIVE blend, so overlapping glass multiplies (order-independent). Reuses
+	// the depth VS (position -> light clip). 1 = clear (no attenuation); < 1 dims/tints that channel of the light.
+	constexpr char kTransPS[] = R"(
+cbuffer PerDrawCB : register(b0) { row_major float4x4 WorldViewProj; uint CasterId; uint3 _pad; float4 Transmittance; };
+float4 main(float4 pos : SV_Position) : SV_Target { return float4(Transmittance.rgb, 1.0); }
+)";
+
 	// Fullscreen triangle (no vertex buffer) + linearize PS: turns the raw perspective
 	// depth map into a readable grayscale (near = white, far = black) for the debug preview.
 	constexpr char kFullscreenVS[] = R"(
@@ -104,6 +113,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 		XMFLOAT4X4 WorldViewProj;
 		uint32_t   CasterId = 0;   // registry index + 1 for the id-atlas (0 = empty); ignored by depth VS
 		uint32_t   _pad[3]  = {};
+		XMFLOAT4   Transmittance = { 1, 1, 1, 1 };  // A5: per-channel transmittance for the glass pass (unused by the depth/id passes)
 	};
 
 	// Preview linearizer cbuffer (b0 of the debug preview pass): one float + padding to 16 bytes.
@@ -331,6 +341,30 @@ bool VirtualShadowMaps::CreateAtlasResources()
 			device->CreateShaderResourceView(idTex.Get(), &isr, &idSRV);
 		}
 	}
+	// A5: colored transmittance atlas (RGBA8), SAME size/layout as the depth atlas. Glass/alpha casters render here
+	// under a multiplicative blend; LLF samples it at t112. Cleared white each frame, so it's a no-op when A5 is off.
+	transTex.Reset(); transRTV.Reset(); transSRV.Reset();
+	{
+		D3D11_TEXTURE2D_DESC tt = td;
+		tt.Format    = DXGI_FORMAT_R8G8B8A8_UNORM;
+		tt.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+		if (SUCCEEDED(device->CreateTexture2D(&tt, nullptr, &transTex))) {
+			device->CreateRenderTargetView(transTex.Get(), nullptr, &transRTV);
+			device->CreateShaderResourceView(transTex.Get(), nullptr, &transSRV);
+		} else {
+			logger::warn("VSM: transmittance atlas creation failed ({}x{}); A5 colored shadows unavailable", rtAtlasW, rtAtlasH);
+		}
+	}
+	// A5: read-only DSV of the opaque depth atlas — the glass pass depth-tests (GREATER) against it WITHOUT writing,
+	// so glass occluded by opaque geometry doesn't tint, while overlapping glass panes all still contribute.
+	dsvReadOnly.Reset();
+	{
+		D3D11_DEPTH_STENCIL_VIEW_DESC ro{};
+		ro.Format        = DXGI_FORMAT_D32_FLOAT;
+		ro.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+		ro.Flags         = D3D11_DSV_READ_ONLY_DEPTH;
+		device->CreateDepthStencilView(depthTex.Get(), &ro, &dsvReadOnly);
+	}
 	// P2: keep the static-cache texture (if it exists) sized with the live atlas; recreating it drops the cache.
 	if (staticDepthTex)
 		CreateStaticCacheResources();
@@ -361,7 +395,14 @@ bool VirtualShadowMaps::CreateStaticCacheResources()
 	dv.Format = DXGI_FORMAT_D32_FLOAT;
 	dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
 	device->CreateDepthStencilView(staticDepthTex.Get(), &dv, &staticDsv);
-	staticCacheValid = false;
+	// A recreated static-cache texture is UNINITIALIZED -> force a full re-bake for BOTH cache paths: P2 (whole,
+	// via staticCacheValid) and P4 (per-light). Clearing bakedPose alone makes every light classify as "new" and
+	// re-bake next frame; we deliberately do NOT reset lastStaticCasterCount (that would re-invalidate a SECOND
+	// time the frame after, a redundant full bake).
+	staticCacheValid      = false;
+	bakedPose.clear();
+	dirtyLights.clear();
+	lastBakedRegistrySize = -1;
 	return staticDsv != nullptr;
 }
 
@@ -410,6 +451,15 @@ void VirtualShadowMaps::SetupResources()
 			logger::warn("VSM: id PS compile failed: {}", idErr ? static_cast<const char*>(idErr->GetBufferPointer()) : "");
 	}
 
+	// A5 transmittance PS (only used when translucentShadows is on): outputs the per-caster transmittance color.
+	{
+		ComPtr<ID3DBlob> tBlob, tErr;
+		if (SUCCEEDED(D3DCompile(kTransPS, sizeof(kTransPS) - 1, "TransPS", nullptr, nullptr, "main", "ps_5_0", 0, 0, &tBlob, &tErr)))
+			device->CreatePixelShader(tBlob->GetBufferPointer(), tBlob->GetBufferSize(), nullptr, &transPS);
+		else
+			logger::warn("VSM: transmittance PS compile failed: {}", tErr ? static_cast<const char*>(tErr->GetBufferPointer()) : "");
+	}
+
 	// position is always R32G32B32_FLOAT at offset 0 (see RebuildRegistry)
 	const D3D11_INPUT_ELEMENT_DESC ie{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
 	device->CreateInputLayout(&ie, 1, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &ilFull);
@@ -437,6 +487,40 @@ void VirtualShadowMaps::SetupResources()
 	// no atlas shadow even though the geometry occludes (confirmed missing: Plane03 at the hearth).
 	rasterDesc.CullMode = D3D11_CULL_NONE;
 	device->CreateRasterizerState(&rasterDesc, &rasterStateNoCull);
+
+	// P4: depth-clear state — DepthFunc ALWAYS + write. A viewport-confined fullscreen triangle (fullscreenVS emits
+	// z = 0 = reverse-Z far) then resets exactly ONE light's atlas block to far before its static casters re-render
+	// (BakeOneLightStatic), so incremental re-bakes don't disturb the other lights' cached blocks.
+	{
+		D3D11_DEPTH_STENCIL_DESC dc{};
+		dc.DepthEnable    = TRUE;
+		dc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+		dc.DepthFunc      = D3D11_COMPARISON_ALWAYS;
+		device->CreateDepthStencilState(&dc, &depthClearState);
+	}
+	// A5: glass depth-tests vs the opaque atlas but does NOT write depth (bound with a read-only DSV), so glass
+	// occluded by opaque geometry is rejected while overlapping panes all still contribute. Same reverse-Z sense.
+	{
+		D3D11_DEPTH_STENCIL_DESC dro{};
+		dro.DepthEnable    = TRUE;
+		dro.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+		dro.DepthFunc      = kReverseZ ? D3D11_COMPARISON_GREATER : D3D11_COMPARISON_LESS;
+		device->CreateDepthStencilState(&dro, &depthReadOnlyState);
+	}
+	// A5: multiplicative, ORDER-INDEPENDENT transmittance accumulation — dst = src*DEST_COLOR + dst*ZERO = src*dst.
+	// Overlapping glass multiplies (commutative), so no per-frame sorting of translucent casters is needed.
+	{
+		D3D11_BLEND_DESC bd{};
+		bd.RenderTarget[0].BlendEnable           = TRUE;
+		bd.RenderTarget[0].SrcBlend              = D3D11_BLEND_DEST_COLOR;
+		bd.RenderTarget[0].DestBlend             = D3D11_BLEND_ZERO;
+		bd.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+		bd.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ZERO;
+		bd.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_ONE;
+		bd.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+		bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+		device->CreateBlendState(&bd, &multiplyBlend);
+	}
 
 	// linear-depth debug view: RGBA8 color target + fullscreen resolve shaders + point sampler
 	D3D11_TEXTURE2D_DESC pd{};   // same dimensions as the depth atlas (rt-sized)
@@ -575,7 +659,7 @@ int VirtualShadowMaps::AssignFaceRes(float a_radius, const RE::NiPoint3& a_light
 void VirtualShadowMaps::PackAtlas()
 {
 	++atlasFrame;
-	const int targetW = vsm::kAtlasBlocksWide * (rtMaxFaceRes * 3);
+	const int targetW = vsm::kAtlasBlocksWide * (rtMaxFaceRes * vsm::kCubeFacesWide);
 	auto freeKey = [](int w, int h) {
 		return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(w)) << 32) | static_cast<std::uint32_t>(h);
 	};
@@ -598,7 +682,7 @@ void VirtualShadowMaps::PackAtlas()
 	for (size_t i = 0; i < lightRecords.size(); ++i) {
 		const void* id = (i < lightPtrs.size()) ? lightPtrs[i] : nullptr;
 		const int   fr = static_cast<int>(lightRecords[i].positionWS.w);
-		const int   bw = fr * 3, bh = fr * 2;
+		const int   bw = fr * vsm::kCubeFacesWide, bh = fr * vsm::kCubeFacesTall;
 		auto it = lightSlots.find(id);
 		if (it != lightSlots.end() && it->second.faceRes == fr) {
 			it->second.lastUsed = atlasFrame;                                   // reuse -> slot STABLE (cache survives)
@@ -606,6 +690,8 @@ void VirtualShadowMaps::PackAtlas()
 			if (it != lightSlots.end()) { releaseSlot(it->second); lightSlots.erase(it); }  // tier changed -> free old block
 			it = lightSlots.emplace(id, allocSlot(bw, bh, fr)).first;
 			staticCacheValid = false;   // P2: a new/moved slot -> any baked static for this light is now in the wrong block
+			dirtyLights.insert(id);     // P4: this light's block moved -> only ITS static cache must re-bake (not the whole atlas)
+			bakedPose.erase(id);        // P4: the new block is uncleared -> treat as "new" so it bakes immediately (not budget-deferred)
 		}
 		lightRecords[i].atlasX = static_cast<float>(it->second.x);
 		lightRecords[i].atlasY = static_cast<float>(it->second.y);
@@ -629,14 +715,86 @@ void VirtualShadowMaps::PackAtlas()
 	}
 }
 
+// Restore one held light's cube VPs + position from its baked-pose snapshot, so the shader samples its cached
+// block at the EXACT pose it was baked with (positionWS.w = faceRes is left untouched — a tier change already
+// invalidated the block). Shared by both cache paths (P4 incremental and P2 whole-cache).
+void VirtualShadowMaps::PoseFreezeLight(size_t a_i, const BakedPose& a_bp)
+{
+	for (int f = 0; f < 6; ++f)
+		lightRecords[a_i].cubeVP[f] = a_bp.cubeVP[f];
+	lightRecords[a_i].positionWS.x = a_bp.pos.x;
+	lightRecords[a_i].positionWS.y = a_bp.pos.y;
+	lightRecords[a_i].positionWS.z = a_bp.pos.z;
+}
+
 // Finalize the P2 static-cache invalidation and, if the cache HOLDS this frame, FREEZE each light's pose to
 // the snapshot the cache was baked with — so the shader samples the held atlas with the EXACT baking pose. A
 // sub-threshold light jitter (fire flicker, moveThisFrame < kLightMoveEps) would otherwise smear the cached
 // static shadow (the reported "pulsing from the fire"). Runs after PackAtlas, before UploadLightBuffer.
 void VirtualShadowMaps::UpdateStaticCacheState()
 {
-	if (!vsm::GetConfig().cacheStaticShadows)
+	auto& cfg = vsm::GetConfig();
+	if (!cfg.cacheStaticShadows)
 		return;
+
+	if (cfg.incrementalCache) {
+		// ---- P4: per-light dirty tracking + budgeted re-bake selection (consumed by RenderDepth) ----
+		bakeThisFrame.clear();
+		// Prune cache state for lights no longer collected: a light can vanish (cell change, cull, out of grace)
+		// while still dirty-and-budget-deferred; without this, bakedPose/dirtyLights would grow unbounded across cells.
+		{
+			const std::unordered_set<const void*> present(lightPtrs.begin(), lightPtrs.end());
+			for (auto it = bakedPose.begin(); it != bakedPose.end();)
+				it = present.count(it->first) ? std::next(it) : bakedPose.erase(it);
+			for (auto it = dirtyLights.begin(); it != dirtyLights.end();)
+				it = present.count(*it) ? std::next(it) : dirtyLights.erase(it);
+		}
+		// A change in the STATIC-caster set (cell change / streaming) invalidates every cached block at once.
+		int staticCount = 0;
+		for (const auto& c : registry)
+			if (c.isStatic && !c.isTranslucent) ++staticCount;
+		if (staticCount != lastStaticCasterCount) {
+			bakedPose.clear();
+			dirtyLights.clear();
+			for (const void* id : lightPtrs) dirtyLights.insert(id);
+			lastStaticCasterCount = staticCount;
+		}
+		// Classify each collected light: NEW / slot-changed (no cached block -> bakedPose erased in PackAtlas) vs
+		// MOVED-in-place (> kLightMoveEps from its baked pose). PackAtlas already flagged slot changes into dirtyLights.
+		std::vector<size_t> newBakes, movedBakes;
+		for (size_t i = 0; i < lightRecords.size(); ++i) {
+			const void* id = (i < lightPtrs.size()) ? lightPtrs[i] : nullptr;
+			const auto bp = bakedPose.find(id);
+			if (bp == bakedPose.end()) { dirtyLights.insert(id); newBakes.push_back(i); continue; }
+			const float dx = lightRecords[i].positionWS.x - bp->second.pos.x;
+			const float dy = lightRecords[i].positionWS.y - bp->second.pos.y;
+			const float dz = lightRecords[i].positionWS.z - bp->second.pos.z;
+			if (std::sqrt(dx * dx + dy * dy + dz * dz) > vsm::kLightMoveEps) dirtyLights.insert(id);
+			if (dirtyLights.count(id)) movedBakes.push_back(i);
+		}
+		// Budget: NEW / slot-changed lights bake immediately (a fresh block is uncleared -> must fill it now, never
+		// show garbage); MOVED-in-place lights are capped at kMaxRebakesPerFrame, biggest faceRes (nearest) first,
+		// so their re-bakes amortize across frames. The rest stay dirty and re-bake on a later frame.
+		std::sort(movedBakes.begin(), movedBakes.end(), [&](size_t a, size_t b) {
+			return lightRecords[a].positionWS.w > lightRecords[b].positionWS.w;
+		});
+		bakeThisFrame = newBakes;
+		for (size_t k = 0; k < movedBakes.size() && static_cast<int>(k) < vsm::kMaxRebakesPerFrame; ++k)
+			bakeThisFrame.push_back(movedBakes[k]);
+		const std::unordered_set<size_t> bakeSet(bakeThisFrame.begin(), bakeThisFrame.end());
+		// Pose-freeze every light that KEEPS its cached block this frame (not baking now) to the pose it was baked
+		// with, so its cached static depth stays aligned. Lights baking this frame keep their CURRENT pose so the
+		// re-bake captures the new pose (BakeOneLightStatic refreshes bakedPose).
+		for (size_t i = 0; i < lightRecords.size(); ++i) {
+			if (bakeSet.count(i)) continue;
+			const void* id = (i < lightPtrs.size()) ? lightPtrs[i] : nullptr;
+			const auto it = bakedPose.find(id);
+			if (it != bakedPose.end()) PoseFreezeLight(i, it->second);
+		}
+		return;
+	}
+
+	// ---- P2 (whole-cache) path (unchanged): one global validity bit, whole-atlas rebake, whole pose-freeze ----
 	if (lastBakedRegistrySize >= 0 && static_cast<int>(registry.size()) != lastBakedRegistrySize)
 		staticCacheValid = false;   // caster-count change ~ cell change
 	if (!staticCacheValid)
@@ -644,13 +802,7 @@ void VirtualShadowMaps::UpdateStaticCacheState()
 	for (size_t i = 0; i < lightRecords.size(); ++i) {
 		const void* id = (i < lightPtrs.size()) ? lightPtrs[i] : nullptr;
 		const auto it = bakedPose.find(id);
-		if (it == bakedPose.end())
-			continue;
-		for (int f = 0; f < 6; ++f)
-			lightRecords[i].cubeVP[f] = it->second.cubeVP[f];
-		lightRecords[i].positionWS.x = it->second.pos.x;   // keep positionWS.w (faceRes; a tier change already invalidated)
-		lightRecords[i].positionWS.y = it->second.pos.y;
-		lightRecords[i].positionWS.z = it->second.pos.z;
+		if (it != bakedPose.end()) PoseFreezeLight(i, it->second);
 	}
 }
 
@@ -1090,6 +1242,27 @@ static bool IsCasterStatic(RE::BSGeometry* a_g, RE::FormID a_ownerRef)
 	return false;
 }
 
+// A5: per-glass transmittance from the material. coverage = opacity (0 clear .. 1 fully tinted), tint = the color the
+// light picks up passing through. Effect-shader glass exposes both via baseColor (NiColorA); lighting-shader glass
+// falls back to a default dim with a white tint (reading BSLightingShaderMaterialBase's own color is a follow-up).
+static void ReadTranslucentMaterial(RE::BSShaderProperty* a_prop, float& a_coverage,
+    float& a_tintR, float& a_tintG, float& a_tintB)
+{
+	a_coverage = vsm::kTranslucentCoverage;
+	a_tintR = a_tintG = a_tintB = 1.0f;
+	if (!a_prop)
+		return;
+	if (auto* efx = netimmerse_cast<RE::BSEffectShaderProperty*>(a_prop)) {
+		if (auto* mat = efx->GetMaterial()) {
+			const RE::NiColorA& bc = mat->baseColor;                 // material rgb tint + alpha coverage
+			a_tintR    = std::clamp(bc.red, 0.0f, 1.0f);
+			a_tintG    = std::clamp(bc.green, 0.0f, 1.0f);
+			a_tintB    = std::clamp(bc.blue, 0.0f, 1.0f);
+			a_coverage = std::clamp(bc.alpha, 0.0f, 1.0f);
+		}
+	}
+}
+
 void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::FormID a_owner, bool a_underBillboard)
 {
 	if (!a_obj || a_depth > vsm::kMaxSceneGraphDepth)  // depth cap guards against scene-graph cycles
@@ -1159,7 +1332,28 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::
 		if (underBillboard) {
 			++rejectedBillboard;
 		} else if (transparent) {
-			++rejectedTransparent;
+			// A5: instead of discarding glass/alpha geometry, capture it as a TRANSLUCENT caster — it renders into
+			// the transmittance atlas to DIM/TINT the light rather than block it. v1 captures clean static-ish glass
+			// (has renderer buffers); skinned/effect translucent (no rd) stays deferred. Off => rejected as before.
+			if (vsm::GetConfig().translucentShadows && rd && rd->vertexBuffer && rd->indexBuffer && triCount &&
+			    registrySeen.insert(static_cast<RE::BSGeometry*>(tri)).second) {
+				CasterEntry e;
+				e.geom          = RE::NiPointer<RE::BSGeometry>(tri);
+				e.vertexStride  = rd->vertexDesc.GetSize();
+				e.indexCount    = triCount * 3u;
+				e.twoSided      = twoSided;
+				e.ownerRef      = a_owner;
+				e.isStatic      = IsCasterStatic(tri, a_owner);
+				e.isTranslucent = true;
+				float coverage = vsm::kTranslucentCoverage, tintR = 1.0f, tintG = 1.0f, tintB = 1.0f;
+				ReadTranslucentMaterial(geoRt.shaderProperty.get(), coverage, tintR, tintG, tintB);
+				e.transR = 1.0f - coverage * (1.0f - tintR);  // per-channel transmittance (1 = clear)
+				e.transG = 1.0f - coverage * (1.0f - tintG);
+				e.transB = 1.0f - coverage * (1.0f - tintB);
+				registry.push_back(std::move(e));
+			} else {
+				++rejectedTransparent;
+			}
 		} else if (decal) {
 			++rejectedDecal;
 		} else if (noCast) {
@@ -1587,12 +1781,51 @@ bool VirtualShadowMaps::ComputeVertAABB(RE::BSGeometry* a_geom, std::uint32_t a_
 // One static caster into the current cube face. Extracted from RenderDepth's face loop; the per-iteration
 // values (caster index i, faceVP, frustum planes, blinkOff) are parameters, everything else is direct
 // member access. Early-returns replace the loop's continue checks.
+// One place for the per-face atlas viewport + face view-proj + frustum-plane math, shared by RenderCasterPass
+// (opaque depth), BakeOneLightStatic (P4 static bake) and RenderTranslucentPass (A5). See the header.
+void VirtualShadowMaps::ForEachLightFace(const LightRecord& a_light,
+    const std::function<void(const DirectX::XMMATRIX&, const DirectX::XMFLOAT4*)>& a_body)
+{
+	const int blockX = static_cast<int>(a_light.atlasX);
+	const int blockY = static_cast<int>(a_light.atlasY);
+	const int lfr    = static_cast<int>(a_light.positionWS.w);   // this light's variable-resolution cube-face size
+	for (int f = 0; f < 6; ++f) {
+		const int col = f % vsm::kCubeFacesWide, row = f / vsm::kCubeFacesWide;   // position in the 3x2 face block
+		const D3D11_VIEWPORT vp{ static_cast<float>(blockX + col * lfr), static_cast<float>(blockY + row * lfr),
+			static_cast<float>(lfr), static_cast<float>(lfr), 0.0f, 1.0f };
+		context->RSSetViewports(1, &vp);
+		XMFLOAT4 planes[6];
+		ExtractFrustumPlanes(a_light.cubeVP[f], planes);
+		a_body(XMLoadFloat4x4(&a_light.cubeVP[f]), planes);
+	}
+}
+
+// Shared tail of every buffer-per-caster draw (see header): push the per-draw cbuffer, bind buffers, draw.
+void VirtualShadowMaps::EmitCasterDraw(size_t a_i, ID3D11Buffer* a_vb, ID3D11Buffer* a_ib,
+    const DirectX::XMMATRIX& a_wvp, const DirectX::XMFLOAT4& a_transmittance)
+{
+	D3D11_MAPPED_SUBRESOURCE m{};
+	if (SUCCEEDED(context->Map(perDrawCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+		auto* pd = reinterpret_cast<PerDrawCB*>(m.pData);
+		XMStoreFloat4x4(&pd->WorldViewProj, a_wvp);
+		pd->CasterId      = static_cast<uint32_t>(a_i) + 1u;  // id-atlas: registry index + 1 (0 = empty)
+		pd->Transmittance = a_transmittance;                  // A5 glass tint; ignored by the depth/id shaders
+		context->Unmap(perDrawCB.Get(), 0);
+	}
+	UINT stride = registry[a_i].vertexStride, offset = 0;
+	context->IASetVertexBuffers(0, 1, &a_vb, &stride, &offset);
+	context->IASetIndexBuffer(a_ib, DXGI_FORMAT_R16_UINT, 0);
+	context->DrawIndexed(registry[a_i].indexCount, 0, 0);
+}
+
 void VirtualShadowMaps::DrawStaticCaster(size_t i, DirectX::FXMMATRIX faceVP, const DirectX::XMFLOAT4 planes[6], bool blinkOff)
 {
 	if (isolateCaster > 0 && static_cast<int>(i) != isolateCaster - 1)
 		return;  // debug: render only one mesh
 	if (blinkOff && static_cast<int>(i) == flashCaster)
 		return;  // flash: this caster is on the "off" blink phase
+	if (registry[i].isTranslucent)
+		return;  // A5: glass/alpha casters render into the transmittance atlas (RenderTranslucentPass), never the opaque depth atlas
 	RE::BSGeometry* geom = registry[i].geom.get();
 	if (!geom)
 		return;
@@ -1609,21 +1842,10 @@ void VirtualShadowMaps::DrawStaticCaster(size_t i, DirectX::FXMMATRIX faceVP, co
 	if (cs.w >= 0.0f && !SphereInFrustum(planes, RE::NiPoint3{ cs.x, cs.y, cs.z }, cs.w))
 		return;
 
-	const XMMATRIX wvp = XMMatrixMultiply(NiTransformToXM(geom->world), faceVP);
-	D3D11_MAPPED_SUBRESOURCE mapped{};
-	if (SUCCEEDED(context->Map(perDrawCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-		auto* pd = reinterpret_cast<PerDrawCB*>(mapped.pData);
-		XMStoreFloat4x4(&pd->WorldViewProj, wvp);
-		pd->CasterId = static_cast<uint32_t>(i) + 1u;  // id-atlas: registry index + 1 (0 = empty)
-		context->Unmap(perDrawCB.Get(), 0);
-	}
-	auto* vb = reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer);
-	UINT stride = registry[i].vertexStride, offset = 0;
-	context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
-	context->IASetIndexBuffer(reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer), DXGI_FORMAT_R16_UINT, 0);
 	// Two-sided casters draw with CULL_NONE so their away-facing side still writes depth.
 	context->RSSetState(registry[i].twoSided ? rasterStateNoCull.Get() : rasterState.Get());
-	context->DrawIndexed(registry[i].indexCount, 0, 0);
+	EmitCasterDraw(i, reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer), reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer),
+	    XMMatrixMultiply(NiTransformToXM(geom->world), faceVP), XMFLOAT4{ 1.0f, 1.0f, 1.0f, 1.0f });  // opaque: transmittance unused
 	++visibleCasters;
 }
 
@@ -1659,17 +1881,7 @@ void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 {
 	const bool blinkOff = (flashCaster >= 0) && (((frameIndex / kFlashHalfPeriodFrames) % 2u) == 1u);
 	for (const auto& light : lightRecords) {
-		const int blockX = static_cast<int>(light.atlasX);
-		const int blockY = static_cast<int>(light.atlasY);
-		const int lfr    = static_cast<int>(light.positionWS.w);   // this light's face resolution (variable res)
-		for (int f = 0; f < 6; ++f) {                              // 6 cube faces (structural)
-			const int col = f % 3, row = f / 3;                    // 3x2 face block (structural)
-			const D3D11_VIEWPORT vp{ static_cast<float>(blockX + col * lfr), static_cast<float>(blockY + row * lfr),
-				static_cast<float>(lfr), static_cast<float>(lfr), 0.0f, 1.0f };
-			context->RSSetViewports(1, &vp);
-			const XMMATRIX faceVP = XMLoadFloat4x4(&light.cubeVP[f]);
-			XMFLOAT4 planes[6];
-			ExtractFrustumPlanes(light.cubeVP[f], planes);
+		ForEachLightFace(light, [&](const XMMATRIX& faceVP, const XMFLOAT4* planes) {
 			for (size_t i = 0; i < registry.size(); ++i) {
 				if (a_filter == 1 && !registry[i].isStatic) continue;   // static-only pass
 				if (a_filter == 2 &&  registry[i].isStatic) continue;   // dynamic-only pass
@@ -1684,8 +1896,59 @@ void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 				for (const auto& r : skinnedRanges)
 					DrawSkinnedRange(r, faceVP, planes, blinkOff);
 			}
-		}
+		});
 	}
+}
+
+// P4: clear ONE light's atlas block to far-Z and re-render only ITS static casters into the static cache. The caller
+// has bound staticDsv (depth-only). A viewport-confined fullscreen triangle (fullscreenVS emits z=0 = reverse-Z far)
+// resets just this light's 3x2 block WITHOUT a whole-atlas clear; its static casters then draw GREATER over it, and
+// bakedPose is refreshed so future cache-HOLD frames sample this block at the pose it was baked with.
+void VirtualShadowMaps::BakeOneLightStatic(size_t a_lightIdx)
+{
+	if (a_lightIdx >= lightRecords.size())
+		return;
+	const LightRecord& light = lightRecords[a_lightIdx];
+	const int blockX = static_cast<int>(light.atlasX);
+	const int blockY = static_cast<int>(light.atlasY);
+	const int lfr    = static_cast<int>(light.positionWS.w);
+
+	// 1. Clear this block to far-Z. fullscreenVS emits z=0, and reverse-Z is committed, so 0 == far (asserted
+	//    below — if kReverseZ were ever flipped this clear would wrongly reset the block to NEAR). The block
+	//    viewport clips the fullscreen triangle to exactly this light's 3x2 region.
+	static_assert(kReverseZ, "BakeOneLightStatic clears via fullscreenVS z=0; that is 'far' only under reverse-Z");
+	const D3D11_VIEWPORT bvp{ static_cast<float>(blockX), static_cast<float>(blockY),
+		static_cast<float>(lfr * vsm::kCubeFacesWide), static_cast<float>(lfr * vsm::kCubeFacesTall), 0.0f, 1.0f };
+	context->RSSetViewports(1, &bvp);
+	context->OMSetDepthStencilState(depthClearState.Get(), 0);   // ALWAYS + write
+	context->RSSetState(rasterState.Get());
+	context->VSSetShader(fullscreenVS.Get(), nullptr, 0);
+	context->PSSetShader(nullptr, nullptr, 0);
+	context->IASetInputLayout(nullptr);
+	context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	context->Draw(3, 0);
+
+	// 2. Render this light's STATIC opaque casters into its 6 faces (depth-only, GREATER over the cleared block).
+	context->OMSetDepthStencilState(depthState.Get(), 0);
+	context->VSSetShader(depthVS.Get(), nullptr, 0);
+	context->IASetInputLayout(ilFull.Get());
+	auto* cb = perDrawCB.Get();
+	context->VSSetConstantBuffers(0, 1, &cb);
+	ForEachLightFace(light, [&](const XMMATRIX& faceVP, const XMFLOAT4* planes) {
+		for (size_t i = 0; i < registry.size(); ++i) {
+			if (!registry[i].isStatic || registry[i].isTranslucent)
+				continue;  // static opaque casters only (DrawStaticCaster also skips translucent)
+			DrawStaticCaster(i, faceVP, planes, false);
+		}
+	});
+
+	// 3. Refresh this light's baked pose so subsequent HOLD frames pose-freeze to it; clear its dirty flag.
+	BakedPose bp;
+	for (int f = 0; f < 6; ++f) bp.cubeVP[f] = light.cubeVP[f];
+	bp.pos = { light.positionWS.x, light.positionWS.y, light.positionWS.z };
+	const void* id = (a_lightIdx < lightPtrs.size()) ? lightPtrs[a_lightIdx] : nullptr;
+	bakedPose[id] = bp;
+	dirtyLights.erase(id);
 }
 
 void VirtualShadowMaps::RenderDepth()
@@ -1705,6 +1968,13 @@ void VirtualShadowMaps::RenderDepth()
 	ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
 	context->PSSetShaderResources(vsm::kShadowAtlasSRVSlot, 1, nullSRV);
 	context->CSSetShaderResources(vsm::kShadowAtlasSRVSlot, 1, nullSRV);
+
+	// A5: reset the transmittance atlas to WHITE every frame (glass renders over it below only when the module is on).
+	// Always-white keeps the always-bound t112 a no-op multiply when A5 is off. One cheap RGBA clear.
+	if (transRTV) {
+		const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		context->ClearRenderTargetView(transRTV.Get(), white);
+	}
 
 	// Shared depth-only pipeline state (both P2 passes + the non-cached path).
 	auto setPipeline = [&](bool withId) {
@@ -1731,6 +2001,7 @@ void VirtualShadowMaps::RenderDepth()
 			return;
 		setPipeline(wantId);
 		RenderCasterPass(0, true);
+		RenderTranslucentPass();  // A5: glass over the completed opaque atlas (depth-tested vs it)
 		return;
 	}
 
@@ -1741,8 +2012,20 @@ void VirtualShadowMaps::RenderDepth()
 		return;
 	}
 
-	// PASS 1 (only when the cache is invalid): bake STATIC casters into the static cache.
-	if (!staticCacheValid) {
+	// PASS 1: bake STATIC casters into the static cache.
+	if (vsm::GetConfig().incrementalCache) {
+		// P4 incremental: bake ONLY the scheduled dirty blocks (bakeThisFrame); every other block persists in the
+		// static cache from earlier frames. No whole-atlas clear — BakeOneLightStatic clears each block itself.
+		if (!bakeThisFrame.empty()) {
+			ID3D11RenderTargetView* noRtv = nullptr;
+			context->OMSetRenderTargets(0, &noRtv, staticDsv.Get());
+			for (size_t idx : bakeThisFrame)
+				BakeOneLightStatic(idx);
+			VSM_LOG("VSM P4: incremental re-bake of {} light block(s); {} still dirty (budget {}/frame)",
+			    bakeThisFrame.size(), dirtyLights.size(), vsm::kMaxRebakesPerFrame);
+		}
+	} else if (!staticCacheValid) {
+		// P2 whole-cache: re-bake ALL static casters at once when the single validity bit is clear.
 		ID3D11RenderTargetView* noRtv = nullptr;
 		context->OMSetRenderTargets(0, &noRtv, staticDsv.Get());     // depth-only, no id
 		context->ClearDepthStencilView(staticDsv.Get(), D3D11_CLEAR_DEPTH, clearZ, 0);
@@ -1774,7 +2057,70 @@ void VirtualShadowMaps::RenderDepth()
 	if (wantId) context->ClearRenderTargetView(idRTV.Get(), zeros);
 	setPipeline(wantId);
 	RenderCasterPass(2, true);
-	// engine state restored by ~GraphicsStateGuard
+	RenderTranslucentPass();  // A5: glass over the completed opaque (static + dynamic) atlas
+	// engine state restored by ~GraphicsStateGuard (note: it does NOT save blend — RenderTranslucentPass restores it)
+}
+
+// A5: render one glass caster into the transmittance atlas — same WVP as the opaque path, but the PS emits the
+// caster's per-channel transmittance under the multiplicative blend. Frustum-culled like the opaque casters; the
+// caller has already bound the transmittance RTV + read-only opaque DSV + multiply blend + two-sided raster.
+void VirtualShadowMaps::DrawTranslucentCaster(size_t i, DirectX::FXMMATRIX faceVP, const DirectX::XMFLOAT4 planes[6])
+{
+	if (i >= registry.size() || !registry[i].isTranslucent)
+		return;
+	RE::BSGeometry* geom = registry[i].geom.get();
+	if (!geom)
+		return;
+	auto* rd = geom->GetGeometryRuntimeData().rendererData;
+	if (!rd || !rd->vertexBuffer || !rd->indexBuffer)
+		return;
+	const DirectX::XMFLOAT4& cs = (i < casterWorldSphere.size()) ? casterWorldSphere[i]
+	                                                             : DirectX::XMFLOAT4{ 0, 0, 0, -1.0f };
+	if (cs.w >= 0.0f && !SphereInFrustum(planes, RE::NiPoint3{ cs.x, cs.y, cs.z }, cs.w))
+		return;
+	EmitCasterDraw(i, reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer), reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer),
+	    XMMatrixMultiply(NiTransformToXM(geom->world), faceVP),
+	    XMFLOAT4{ registry[i].transR, registry[i].transG, registry[i].transB, 1.0f });  // per-channel light multiplier
+	// Not counted in visibleCasters — that tallies OPAQUE caster draws for the menu readout.
+}
+
+// A5: render glass/alpha casters into the RGBA transmittance atlas. Runs AFTER the opaque atlas is complete so it can
+// depth-test (read-only) against it — glass hidden behind opaque geometry doesn't tint. The multiplicative blend makes
+// overlapping panes accumulate ORDER-INDEPENDENTLY (no sorting). The atlas was already cleared white in RenderDepth,
+// so with no glass (or the module off) it stays a no-op multiply by 1.
+void VirtualShadowMaps::RenderTranslucentPass()
+{
+	if (!vsm::GetConfig().translucentShadows || !transRTV || !transPS || !dsvReadOnly)
+		return;
+	if (!haveTestLight || registry.empty())
+		return;
+	bool hasTranslucent = false;
+	for (const auto& c : registry)
+		if (c.isTranslucent) { hasTranslucent = true; break; }
+	if (!hasTranslucent)
+		return;  // no glass -> transmittance atlas stays white (a no-op multiply)
+
+	context->OMSetRenderTargets(1, transRTV.GetAddressOf(), dsvReadOnly.Get());
+	context->OMSetBlendState(multiplyBlend.Get(), nullptr, 0xFFFFFFFF);
+	context->OMSetDepthStencilState(depthReadOnlyState.Get(), 0);   // GREATER, depth-write OFF — test vs opaque atlas
+	context->RSSetState(rasterStateNoCull.Get());                   // glass casts from both faces
+	context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	context->VSSetShader(depthVS.Get(), nullptr, 0);
+	context->PSSetShader(transPS.Get(), nullptr, 0);
+	context->IASetInputLayout(ilFull.Get());
+	auto* cb = perDrawCB.Get();
+	context->VSSetConstantBuffers(0, 1, &cb);
+	context->PSSetConstantBuffers(0, 1, &cb);
+
+	for (const auto& light : lightRecords)
+		ForEachLightFace(light, [&](const XMMATRIX& faceVP, const XMFLOAT4* planes) {
+			for (size_t i = 0; i < registry.size(); ++i)
+				DrawTranslucentCaster(i, faceVP, planes);
+		});
+
+	// Restore default (opaque) blend — GraphicsStateGuard does NOT save blend state, so the engine's next draws would
+	// otherwise inherit our multiplicative blend. RTV / depth / raster / VS / PS / viewport are restored by ~guard.
+	context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
 }
 
 void VirtualShadowMaps::RenderFrame()
@@ -1864,6 +2210,13 @@ void VirtualShadowMaps::DrawMenu()
 	ImGui::SameLine(); ImGui::TextDisabled("re-render only dynamic casters each frame");
 	settingsDirty |= ImGui::Checkbox("Cull off-screen lights (P3 performance)##VSM", &vsm::GetConfig().cullCasters);
 	ImGui::SameLine(); ImGui::TextDisabled("drop lights behind camera / beyond fShadowDistance");
+	settingsDirty |= ImGui::Checkbox("Incremental cache (P4 performance)##VSM", &vsm::GetConfig().incrementalCache);
+	ImGui::SameLine(); ImGui::TextDisabled("per-light re-bake; needs 'Cache static shadows'");
+	if (ImGui::Checkbox("Translucent shadows (A5)##VSM", &vsm::GetConfig().translucentShadows)) {
+		settingsDirty = true;
+		registryDirty = true;  // capture (or drop) glass/alpha casters on the next registry rebuild
+	}
+	ImGui::SameLine(); ImGui::TextDisabled("glass/alpha casters dim + tint the light");
 
 #if VSM_DIAGNOSTICS
 	ImGui::SameLine();
