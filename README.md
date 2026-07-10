@@ -13,14 +13,23 @@ exposes a tiny generic menu hook, so nothing of ours lives in CS's DLL.
 
 Verified working in-game:
 
+- **Unlimited local-light shadows** — every eligible local light the engine drops casts; there is
+  no arbitrary light cap (the atlas and light buffer grow on demand).
 - **Static local-light shadows** — rooms, furniture, held items; camera-stable.
 - **Skinned-character shadows** — the player and NPC bodies, via our own CPU skinning using the
   engine's world-absolute bone matrices.
+- **Variable per-light resolution + soft edges** — each light's cube-face resolution is chosen per
+  frame on a power-of-two ladder (floor up to your `iShadowMapResolution`) by on-screen importance,
+  and a PCF kernel softens the penumbra.
 - **In-menu UI** — the settings panel renders inside the Community Shaders menu.
+
+Opt-in performance modules (default **off**, toggled live in the menu) — static/dynamic shadow
+caching and off-screen light culling. Enable them to trade a little accuracy for speed once you've
+confirmed the baseline looks right.
 
 Only opaque, solid, camera-independent geometry casts; billboards, transparent/effect surfaces,
 decals, and engine "does not cast" meshes are excluded. Translucent/alpha shadowing (tinted light
-through stained glass, etc.) and head/hair skinned meshes are not yet done.
+through stained glass, etc.), radius-edge fade, and head/hair skinned meshes are not yet done.
 
 ## Building
 
@@ -57,7 +66,11 @@ Shaders/...                            CS shader overrides that sample our atlas
 ```
 
 Runtime settings live in `Data/SKSE/Plugins/VirtualShadowMaps.toml` (written with a documented
-default on first launch) and are also editable live from the Community Shaders menu.
+default on first launch) and are also editable live from the Community Shaders menu. Because this
+plugin replaces Skyrim's own local-light shadows, it also honors your existing `SkyrimPrefs.ini`
+`[Display]` shadow keys — `iShadowMapResolution` (max per-light resolution), `fShadowBiasScale`,
+`fShadowDistance`, and `iBlurDeferredShadowMask` (soft-shadow radius) — so your prior intent carries
+over.
 
 ## Relationship to Community Shaders & License
 
