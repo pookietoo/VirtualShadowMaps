@@ -63,6 +63,9 @@ namespace
 		    "# Performance (O4, default false): skip a light's entire 6-face caster pass when NO caster lies within its\n"
 		    "# radius (CPU sphere-vs-radius pre-check). Off-by-default optimization, UNTESTED in-game.\n"
 		    "cullEmptyLightPasses = {}\n"
+		    "# Alpha-tested cutout shadows (A6, default false): foliage / grates / chain / hair sample their diffuse alpha\n"
+		    "# and clip() in the depth pass, casting punched-through silhouettes instead of solid quads. Fail-safe.\n"
+		    "alphaTestedShadows = {}\n"
 		    "\n"
 		    "# Per-shape shadow-caster overrides. Match the caster's model NIF path (as a substring — use path\n"
 		    "# fragments like '\\effects\\', '\\magic\\', '\\lod\\') and/or its shape name (WHOLE-TOKEN: a name is\n"
@@ -90,6 +93,7 @@ namespace
 		    c.incrementalCache,
 		    c.translucentShadows,
 		    c.cullEmptyLightPasses,
+		    c.alphaTestedShadows,
 		    ToTomlArray(c.forceCast),
 		    ToTomlArray(c.forceNoCast),
 		    vsm::kFaceRes, vsm::kMaxLights);
@@ -128,6 +132,7 @@ namespace vsm
 		incrementalCache   = tbl["general"]["incrementalCache"].value_or(incrementalCache);
 		translucentShadows = tbl["general"]["translucentShadows"].value_or(translucentShadows);
 		cullEmptyLightPasses = tbl["general"]["cullEmptyLightPasses"].value_or(cullEmptyLightPasses);
+		alphaTestedShadows   = tbl["general"]["alphaTestedShadows"].value_or(alphaTestedShadows);
 
 		// [classification] pattern lists (arrays of strings). Absent section => leave empty (no override).
 		forceCast.clear();

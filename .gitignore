@@ -31,6 +31,11 @@ testing/
 # ---- Detailed local documentation (deep architecture write-up) — not part of the shipped project ----
 docs/
 
+# ---- Diagnostics apparatus (dev-only; VSM_DIAGNOSTICS, compiled OUT of the deployment build and excluded
+# ---- from CMake sources in a deploy build). Kept LOCAL for dev builds (-DVSM_DEV_BUILD=ON); NOT shipped. ----
+plugin/src/VirtualShadowMaps_Diagnostics.cpp
+plugin/src/VirtualShadowMaps_Diagnostics.h
+
 # ---- Holding area for removed code (user empties this) ----
 trash/
 

@@ -126,6 +126,14 @@ private:
 		                                                     // opaque depth atlas. Skipped by every depth pass.
 		float                         transR = 1.0f, transG = 1.0f, transB = 1.0f;  // A5 per-channel transmittance
 		                                                     // (1 = clear) = 1 - coverage*(1 - materialTint); what fraction of each light channel passes
+		// A6 alpha-tested cutout: when alphaTested AND alphaTestedShadows is on, the depth pass samples diffuseSRV's
+		// alpha at the vertex UV (byte offset uvUVOffset, R16G16_FLOAT) and clip()s below alphaThreshold -> silhouette.
+		// diffuseSRV is a RAW pointer OWNED BY THE GAME (valid while `geom` is alive, which we hold via NiPointer);
+		// null / not-alphaTested -> the caster renders as a solid quad (fail-safe).
+		bool                          alphaTested   = false;
+		ID3D11ShaderResourceView*     diffuseSRV    = nullptr;
+		float                         alphaThreshold = 0.0f;   // NiAlphaProperty::alphaThreshold / 255
+		std::uint32_t                 uvUVOffset    = 0;        // VA_TEXCOORD0 byte offset within the vertex stride
 	};
 
 	// One record per shadow-casting light, uploaded to a GPU buffer so the LLF shader
@@ -227,6 +235,13 @@ private:
 	void PoseFreezeLight(size_t a_i, const BakedPose& a_bp);  // restore one held light's cube VPs + pos from its baked snapshot (keeps faceRes)
 	ComPtr<ID3D11VertexShader>       depthVS;
 	ComPtr<ID3D11InputLayout>        ilFull;    // POSITION R32G32B32_FLOAT (always; see RebuildRegistry)
+	// A6 alpha-tested cutout depth pass (opt-in, alphaTestedShadows). VS passes UV, PS clips on diffuse alpha.
+	ComPtr<ID3D11VertexShader>       alphaVS;
+	ComPtr<ID3D11PixelShader>        alphaPS;
+	ComPtr<ID3D11SamplerState>       alphaSampler;   // wrap+linear for the diffuse alpha sample
+	ComPtr<ID3DBlob>                 alphaVSBytecode; // kept to CreateInputLayout per UV-offset on demand
+	std::unordered_map<std::uint32_t, ComPtr<ID3D11InputLayout>> alphaLayouts;  // POSITION@0 + TEXCOORD@uvOffset (R16G16_FLOAT), cached
+	ID3D11InputLayout* GetAlphaLayout(std::uint32_t a_uvOffset);  // create/reuse the alpha input layout for a UV byte offset
 	// Occluder-id atlas: R32_UINT target rasterized alongside depth. Each draw writes (registryIndex+1);
 	// the depth test keeps the nearest, so a texel names the EXACT closest caster (0 = empty). Diagnostic.
 	ComPtr<ID3D11Texture2D>          idTex;

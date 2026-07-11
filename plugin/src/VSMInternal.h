@@ -16,7 +16,7 @@ namespace vsm::internal
 	// plugin DLL is actually running. Bump the description each build. (The SKSE plugin version
 	// number is separate — see Plugin.h / CMake project VERSION.)
 	inline constexpr char kBuildTag[] =
-	    "0.9.96 - multi-partition skinning explosion + player-cylinder fixed (Rule B, confirmed in-game); adds full-buffer, our-vs-engine, and GPU-readback skin diagnostics.";
+	    "0.9.97 - correctness batch (UNTESTED): removed the redundant radius fade (matches CS light attenuation), added normal-offset self-shadow bias, and alpha-tested cutout clip (config alphaTestedShadows, default off).";
 
 	// Depth convention for the shadow atlas. TRUE = reverse-Z (near->1, far->0), which is Skyrim's own
 	// main-view convention and gives uniform float-depth precision across the light's range. This flag is the

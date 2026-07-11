@@ -77,6 +77,11 @@ plugin replaces Skyrim's own local-light shadows, it also honors your existing `
 `fShadowDistance`, and `iBlurDeferredShadowMask` (soft-shadow radius) — so your prior intent carries
 over.
 
+The `.toml` also carries optional, **off-by-default** modules, each documented inline in the file:
+colored translucent shadows (`translucentShadows`), static-shadow caching (`cacheStaticShadows` /
+`incrementalCache`), alpha-tested cutout silhouettes for foliage/grates (`alphaTestedShadows`),
+per-shape cast overrides (`forceCast` / `forceNoCast`), and a couple of performance toggles.
+
 ## Relationship to Community Shaders & License
 
 This project is licensed under **GPL-3.0** (see [`LICENSE`](LICENSE)).

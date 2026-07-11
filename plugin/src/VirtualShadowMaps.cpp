@@ -25,7 +25,10 @@
 #include "RE/N/NiSkinInstance.h"        // GPU-skinned: skinData/skinPartition/bones/boneMatrices
 #include "RE/N/NiSkinData.h"            // inverse-bind (boneData[b].skinToBone)
 #include "RE/N/NiSkinPartition.h"       // bind-pose buffers + bone indices/weights per partition
-#include "RE/N/NiAlphaProperty.h"       // GetAlphaBlending() — skip transparent geometry as casters
+#include "RE/N/NiAlphaProperty.h"       // GetAlphaBlending()/GetAlphaTesting() + alphaThreshold (A6 cutout clip)
+#include "RE/B/BSLightingShaderProperty.h"     // A6: material access for the alpha-tested cutout's diffuse texture
+#include "RE/B/BSLightingShaderMaterialBase.h" // A6: diffuseTexture
+#include "RE/N/NiSourceTexture.h"              // A6: rendererTexture->resourceView (the diffuse SRV)
 #include "RE/N/NiBillboardNode.h"       // camera-facing effect planes (smoke/vapor/fire) — excluded as casters
 #include "RE/T/TESObjectREFR.h"         // light reference -> base object (identity + authored LIGH data)
 #include "RE/T/TESObjectLIGH.h"         // OBJ_LIGH: nearDistance, flags (shadow type), color, radius
@@ -86,6 +89,27 @@ cbuffer PerDrawCB : register(b0) { row_major float4x4 WorldViewProj; uint Caster
 float4 main(float4 pos : SV_Position) : SV_Target { return float4(Transmittance.rgb, 1.0); }
 )";
 
+	// A6: alpha-TESTED cutout depth pass. VS passes the caster's UV through; PS samples the diffuse alpha and
+	// clip()s below the material threshold so foliage / grates / chain / hair cast their punched-through
+	// SILHOUETTE instead of a solid quad. Still writes CasterId to the id atlas (like kIdPS). Off unless
+	// alphaTestedShadows is on AND the caster was fully wired (diffuse SRV + a UV attribute); else it renders
+	// via the solid kDepthVS/kIdPS path (fail-safe).
+	constexpr char kAlphaVS[] = R"(
+cbuffer PerDrawCB : register(b0) { row_major float4x4 WorldViewProj; uint CasterId; float AlphaThreshold; uint2 _pad; float4 Transmittance; };
+struct VOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VOut main(float3 pos : POSITION, float2 uv : TEXCOORD0) { VOut o; o.pos = mul(float4(pos, 1.0), WorldViewProj); o.uv = uv; return o; }
+)";
+	constexpr char kAlphaPS[] = R"(
+cbuffer PerDrawCB : register(b0) { row_major float4x4 WorldViewProj; uint CasterId; float AlphaThreshold; uint2 _pad; float4 Transmittance; };
+Texture2D    DiffuseTex  : register(t0);
+SamplerState DiffuseSamp : register(s0);
+uint main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+	float a = DiffuseTex.Sample(DiffuseSamp, uv).a;
+	clip(a - AlphaThreshold);   // discard fragments below the material's alpha-test threshold -> silhouette
+	return CasterId;
+}
+)";
+
 	// Fullscreen triangle (no vertex buffer) + linearize PS: turns the raw perspective
 	// depth map into a readable grayscale (near = white, far = black) for the debug preview.
 	constexpr char kFullscreenVS[] = R"(
@@ -115,8 +139,9 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	struct alignas(16) PerDrawCB
 	{
 		XMFLOAT4X4 WorldViewProj;
-		uint32_t   CasterId = 0;   // registry index + 1 for the id-atlas (0 = empty); ignored by depth VS
-		uint32_t   _pad[3]  = {};
+		uint32_t   CasterId = 0;          // registry index + 1 for the id-atlas (0 = empty); ignored by depth VS
+		float      AlphaThreshold = 0.0f; // A6: diffuse-alpha clip threshold for the alpha-tested cutout PS (ignored by opaque/id/trans)
+		uint32_t   _pad[2]  = {};
 		XMFLOAT4   Transmittance = { 1, 1, 1, 1 };  // A5: per-channel transmittance for the glass pass (unused by the depth/id passes)
 	};
 
@@ -481,6 +506,27 @@ void VirtualShadowMaps::SetupResources()
 			device->CreatePixelShader(tBlob->GetBufferPointer(), tBlob->GetBufferSize(), nullptr, &transPS);
 		else
 			logger::warn("VSM: transmittance PS compile failed: {}", tErr ? static_cast<const char*>(tErr->GetBufferPointer()) : "");
+	}
+
+	// A6 alpha-tested cutout depth pass (opt-in). VS passes UV; PS clips on diffuse alpha. Keep the VS bytecode
+	// so GetAlphaLayout can CreateInputLayout per UV offset on demand. All failures are non-fatal (feature just
+	// stays inert -> casters render solid).
+	{
+		ComPtr<ID3DBlob> aErr;
+		if (SUCCEEDED(D3DCompile(kAlphaVS, sizeof(kAlphaVS) - 1, "AlphaVS", nullptr, nullptr, "main", "vs_5_0", 0, 0, &alphaVSBytecode, &aErr)))
+			device->CreateVertexShader(alphaVSBytecode->GetBufferPointer(), alphaVSBytecode->GetBufferSize(), nullptr, &alphaVS);
+		else
+			logger::warn("VSM: alpha VS compile failed: {}", aErr ? static_cast<const char*>(aErr->GetBufferPointer()) : "");
+		ComPtr<ID3DBlob> apBlob, apErr;
+		if (SUCCEEDED(D3DCompile(kAlphaPS, sizeof(kAlphaPS) - 1, "AlphaPS", nullptr, nullptr, "main", "ps_5_0", 0, 0, &apBlob, &apErr)))
+			device->CreatePixelShader(apBlob->GetBufferPointer(), apBlob->GetBufferSize(), nullptr, &alphaPS);
+		else
+			logger::warn("VSM: alpha PS compile failed: {}", apErr ? static_cast<const char*>(apErr->GetBufferPointer()) : "");
+		D3D11_SAMPLER_DESC sd{};
+		sd.Filter   = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+		sd.MaxLOD   = D3D11_FLOAT32_MAX;
+		device->CreateSamplerState(&sd, &alphaSampler);
 	}
 
 	// position is always R32G32B32_FLOAT at offset 0 (see RebuildRegistry)
@@ -1554,6 +1600,24 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::
 			e.twoSided     = twoSided;
 			e.ownerRef     = a_owner;
 			e.isStatic     = IsCasterStatic(tri, a_owner);       // R5: cache-safe worldspace statics
+			// A6: alpha-TESTED cutout (foliage/grate/chain) — capture the diffuse SRV + threshold + UV offset so the
+			// depth pass clip()s the silhouette. Any missing piece leaves alphaTested=false -> renders as a solid quad.
+			if (vsm::GetConfig().alphaTestedShadows && geoRt.alphaProperty && geoRt.alphaProperty->GetAlphaTesting() &&
+			    !geoRt.alphaProperty->GetAlphaBlending() && rd->vertexDesc.HasFlag(RE::BSGraphics::Vertex::VF_UV)) {
+				const std::uint32_t uvOff = rd->vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_TEXCOORD0);
+				ID3D11ShaderResourceView* diffSrv = nullptr;
+				if (auto* lp = netimmerse_cast<RE::BSLightingShaderProperty*>(geoRt.shaderProperty.get()))
+					if (auto* mat = static_cast<RE::BSLightingShaderMaterialBase*>(lp->material))
+						if (auto* dt = mat->diffuseTexture.get())
+							if (auto* rt = dt->rendererTexture)
+								diffSrv = rt->resourceView;
+				if (diffSrv && uvOff + 4u <= e.vertexStride) {  // valid UV (half2 = 4 bytes) inside the stride
+					e.alphaTested    = true;
+					e.diffuseSRV     = diffSrv;
+					e.alphaThreshold = static_cast<float>(geoRt.alphaProperty->alphaThreshold) / 255.0f;
+					e.uvUVOffset     = uvOff;
+				}
+			}
 			registry.push_back(std::move(e));
 		}
 	}
@@ -1971,6 +2035,25 @@ void VirtualShadowMaps::ForEachLightFace(const LightRecord& a_light,
 }
 
 // Shared tail of every buffer-per-caster draw (see header): push the per-draw cbuffer, bind buffers, draw.
+// A6: create/reuse the alpha-tested input layout (POSITION@0 R32G32B32_FLOAT + TEXCOORD@uvOffset R16G16_FLOAT)
+// for a given UV byte offset. Returns null on failure -> caller falls back to the solid path (fail-safe).
+ID3D11InputLayout* VirtualShadowMaps::GetAlphaLayout(std::uint32_t a_uvOffset)
+{
+	if (!alphaVSBytecode || !device)
+		return nullptr;
+	if (auto it = alphaLayouts.find(a_uvOffset); it != alphaLayouts.end())
+		return it->second.Get();
+	const D3D11_INPUT_ELEMENT_DESC ie[2] = {
+		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 0, DXGI_FORMAT_R16G16_FLOAT,    0, a_uvOffset, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+	};
+	ComPtr<ID3D11InputLayout> layout;
+	if (FAILED(device->CreateInputLayout(ie, 2, alphaVSBytecode->GetBufferPointer(), alphaVSBytecode->GetBufferSize(), &layout)))
+		layout.Reset();  // cache the null too -> don't retry a bad offset every frame
+	alphaLayouts[a_uvOffset] = layout;
+	return layout.Get();
+}
+
 void VirtualShadowMaps::EmitCasterDraw(size_t a_i, ID3D11Buffer* a_vb, ID3D11Buffer* a_ib,
     const DirectX::XMMATRIX& a_wvp, const DirectX::XMFLOAT4& a_transmittance)
 {
@@ -1978,8 +2061,9 @@ void VirtualShadowMaps::EmitCasterDraw(size_t a_i, ID3D11Buffer* a_vb, ID3D11Buf
 	if (SUCCEEDED(context->Map(perDrawCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
 		auto* pd = reinterpret_cast<PerDrawCB*>(m.pData);
 		XMStoreFloat4x4(&pd->WorldViewProj, a_wvp);
-		pd->CasterId      = static_cast<uint32_t>(a_i) + 1u;  // id-atlas: registry index + 1 (0 = empty)
-		pd->Transmittance = a_transmittance;                  // A5 glass tint; ignored by the depth/id shaders
+		pd->CasterId       = static_cast<uint32_t>(a_i) + 1u;   // id-atlas: registry index + 1 (0 = empty)
+		pd->AlphaThreshold = registry[a_i].alphaThreshold;      // A6 cutout clip threshold (ignored by opaque/id/trans PS)
+		pd->Transmittance  = a_transmittance;                   // A5 glass tint; ignored by the depth/id shaders
 		context->Unmap(perDrawCB.Get(), 0);
 	}
 	UINT stride = registry[a_i].vertexStride, offset = 0;
@@ -2014,8 +2098,30 @@ void VirtualShadowMaps::DrawStaticCaster(size_t i, DirectX::FXMMATRIX faceVP, co
 
 	// Two-sided casters draw with CULL_NONE so their away-facing side still writes depth.
 	context->RSSetState(registry[i].twoSided ? rasterStateNoCull.Get() : rasterState.Get());
+
+	// A6: alpha-tested cutout? Switch to the UV/clip pipeline for THIS draw, then restore the solid one. Every
+	// prerequisite is re-checked (toggle, wired caster, valid SRV/shaders/layout) — any miss keeps the solid path.
+	ID3D11InputLayout* alphaLayout = nullptr;
+	const bool useAlpha = vsm::GetConfig().alphaTestedShadows && registry[i].alphaTested && registry[i].diffuseSRV &&
+	                      alphaVS && alphaPS && (alphaLayout = GetAlphaLayout(registry[i].uvUVOffset)) != nullptr;
+	if (useAlpha) {
+		context->VSSetShader(alphaVS.Get(), nullptr, 0);
+		context->PSSetShader(alphaPS.Get(), nullptr, 0);
+		context->IASetInputLayout(alphaLayout);
+		context->RSSetState(rasterStateNoCull.Get());  // cutouts (foliage) are effectively two-sided
+		ID3D11ShaderResourceView* diffSrv = registry[i].diffuseSRV;
+		context->PSSetShaderResources(0, 1, &diffSrv);
+		context->PSSetSamplers(0, 1, alphaSampler.GetAddressOf());
+	}
 	EmitCasterDraw(i, reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer), reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer),
 	    XMMatrixMultiply(NiTransformToXM(geom->world), faceVP), XMFLOAT4{ 1.0f, 1.0f, 1.0f, 1.0f });  // opaque: transmittance unused
+	if (useAlpha) {  // restore the solid pipeline for the next caster
+		context->VSSetShader(depthVS.Get(), nullptr, 0);
+		context->PSSetShader(idPS.Get(), nullptr, 0);
+		context->IASetInputLayout(ilFull.Get());
+		ID3D11ShaderResourceView* nullSRV = nullptr;
+		context->PSSetShaderResources(0, 1, &nullSRV);
+	}
 	++visibleCasters;
 }
 

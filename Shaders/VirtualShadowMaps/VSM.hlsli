@@ -20,8 +20,7 @@ namespace VSM
 	static const float kOutOfCubeNdc = 9.0;  // ndc sentinel value meaning "no valid projection" (out of cube / behind)
 	static const float kDivEps      = 1e-4;  // near-zero divide / behind-light guard
 	static const float kArgMinInit  = 1e30;  // initial best-distance for the nearest-light argmin
-		static const float kRadiusFadeBand = 0.12;  // A1: fade the shadow toward lit over the outer 12% of the light's radius (far
-		                                            // plane), so it vanishes with the light's own falloff instead of a hard circular cutoff.
+		static const float kNormalOffsetK = 2.0; // A3: normal-offset bias strength (texel footprints of receiver shift at grazing)
 		static const float kDebugMatchThresh = 5.0; // debug mode 16 ONLY: nearest-light match distance threshold (was the b13
 		                                            // gMatchThresh field, now repurposed as gTranslucentOn).
 	static const int   kMaxPCFRadius = 4;    // clamp cap for the runtime soft-shadow PCF half-width (gPCFRadius, from
@@ -221,8 +220,21 @@ namespace VSM
 			} else {
 				matched       = best;
 				LightRecord L = ShadowLights[best];
-				face          = FaceFromDir(W - L.positionWS.xyz);
-				float4 clip   = mul(float4(W, 1.0), L.cubeVP[face]);
+				// A3 NORMAL-OFFSET BIAS: shift the receiver along its surface normal toward the light by a fraction
+				// of the shadow texel's world footprint, scaled up at grazing angles (where acne + peter-panning
+				// live). A shifted receiver samples the atlas depth in FRONT of its own surface, escaping texel
+				// quantization at the SOURCE — kills acne AND peter-panning far better than a pure depth bias (which
+				// only trades one for the other). The calculated slope bias below stays as a small floor. Reverse-Z
+				// safe: it reduces linPix (receiver appears nearer the light) in the convention-independent
+				// linear-distance compare, so it can only REDUCE self-shadowing. Foundation for the soft-shadow spine.
+				float3 nrmA3  = normalize(worldNormal);
+				float3 toLA3  = L.positionWS.xyz - W;
+				float  dLA3   = length(toLA3);
+				float  ndlA3  = saturate(dot(nrmA3, toLA3 / max(dLA3, kDivEps)));
+				float  footA3 = dLA3 * (2.0 / L.positionWS.w);                 // shadow texel world size at this receiver distance
+				float3 Woff   = W + nrmA3 * (footA3 * saturate(1.0 - ndlA3) * kNormalOffsetK);
+				face          = FaceFromDir(Woff - L.positionWS.xyz);
+				float4 clip   = mul(float4(Woff, 1.0), L.cubeVP[face]);
 				clipW         = clip.w;
 				if (clip.w <= kDivEps) {
 					reason = 3;                                        // behind the light -> lit
@@ -282,11 +294,12 @@ namespace VSM
 									cnt += 1.0;
 								}
 							shadow = sum / cnt;  // 0=shadowed .. 1=lit (fractional=penumbra); pr=0 -> single tap (hard)
-							// A1 far-distance fade: as the receiver nears the light's max reach (farPlane = radius), lift the
-							// shadow toward lit so it disappears in step with the light's own radiometric falloff — removes the
-							// hard circular cutoff where the atlas runs out of depth. Confined to the outer band (light ~0 there).
-							float fadeA1 = saturate((L.farPlane - linPix) / max(L.farPlane * kRadiusFadeBand, kDivEps));
-							shadow = lerp(1.0, shadow, fadeA1);
+							// NO far-distance fade here — we MATCH CS's light falloff instead of imposing our own. CS already
+							// multiplies our shadow by the light's own attenuation (Lighting.hlsl: lightColor *= intensityMultiplier
+							// = InverseSquareLighting::GetAttenuation, which smoothsteps to 0 at the radius), so the shadow's
+							// visible effect vanishes exactly as the light does. The old linear fadeA1 double-faded on a MISMATCHED
+							// curve (12% linear vs CS's inverse-square) — that lift, while CS's light is still bright, was the
+							// visible border. Deleting it hooks CS's fade for free and tracks their updates.
 						}
 						// Tint modes: record what shadowed this pixel so Lighting.hlsl can paint it.
 						if ((gMode == 23 || gMode == 24 || gMode == 25) && shadow < 0.5) {

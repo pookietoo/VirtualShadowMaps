@@ -28,6 +28,9 @@ namespace vsm
 		                                   // light passing through (transmittance atlas at t112), instead of being excluded entirely
 		bool  cullEmptyLightPasses = false;  // O4 perf (default OFF): skip a light's entire 6-face caster pass when NO caster (static,
 		                                     // dynamic, or skinned) lies within its radius — CPU sphere-vs-radius pre-check. UNTESTED.
+		bool  alphaTestedShadows   = false;  // A6 (default OFF): alpha-TESTED cutouts (foliage/grates/chain/hair) sample their diffuse
+		                                     // alpha + clip() in the depth pass so they cast punched-through SILHOUETTES, not solid quads.
+		                                     // Fail-safe: any caster we can't fully wire (no diffuse SRV / no UV) falls back to a solid quad.
 
 		// [classification] — per-shape shadow-caster overrides matched against the caster's model NIF path
 		// (substring, e.g. '\effects\') and shape name (WHOLE-TOKEN, so 'marker' hits 'EditorMarker' but not

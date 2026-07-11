@@ -11,7 +11,7 @@
 #include "Common/Shading.hlsli"
 #include "Common/SharedData.hlsli"
 #include "VirtualShadowMaps/VSM.hlsli"  // Virtual Shadow Maps add-on (samples our shadow atlas)
-// VSM include rev: 0.9.50 (bump this when VSM.hlsli changes so CS recompiles Lighting.hlsl — its
+// VSM include rev: 0.9.51 — removed fadeA1 (radius fade now matches CS light attenuation). (bump this when VSM.hlsli changes so CS recompiles Lighting.hlsl — its
 // shader cache keys on THIS file, not the include, so an include-only edit wouldn't take effect).
 #include "Common/Skinned.hlsli"
 #include "Common/Triplanar.hlsli"
