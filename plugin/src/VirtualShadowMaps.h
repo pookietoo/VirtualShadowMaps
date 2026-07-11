@@ -302,6 +302,14 @@ private:
 	// translucent effects that should not throw a solid shadow. This was the moving 'Plane03' vapor-smoke
 	// bar — opaque-material + CastShadows=on, so no material flag caught it; being a billboard is what does.
 	int rejectedBillboard = 0;
+	// [classification] config overrides: shapes the user's forceNoCast patterns rejected, and shapes the
+	// forceCast patterns forced in past every built-in exclusion. Both 0 unless the user set patterns.
+	int rejectedUserNoCast = 0;
+	int userForcedCast     = 0;
+	// Research-derived engine "don't cast" flag excludes: kNotVisible geometry, and the shader-flag/water
+	// class (kNonProjectiveShadows/kBillboard/kWireframe/kLOD*/BSWaterShaderProperty). Mirror what vanilla omits.
+	int rejectedNotVisible = 0;
+	int rejectedEngineFlag = 0;
 	bool                     registryDirty      = true;
 	uint32_t                 framesSinceRebuild = 0;
 	int                      visibleCasters     = 0;  // drawn this frame (after frustum cull, summed over faces)

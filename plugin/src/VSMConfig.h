@@ -1,5 +1,8 @@
 #pragma once
 
+#include <string>
+#include <vector>
+
 // ============================================================================
 // Runtime configuration for Virtual Shadow Maps, persisted to
 //   Data/SKSE/Plugins/VirtualShadowMaps.toml
@@ -23,6 +26,13 @@ namespace vsm
 		                                   // budgeted re-bakes (only the dirty light's block re-renders), instead of P2's whole-cache rebuild
 		bool  translucentShadows = false;  // A5 module (default OFF): colored translucent shadows — glass/alpha casters dim + tint the
 		                                   // light passing through (transmittance atlas at t112), instead of being excluded entirely
+
+		// [classification] — per-shape shadow-caster overrides matched against the caster's model NIF path
+		// (substring, e.g. '\effects\') and shape name (WHOLE-TOKEN, so 'marker' hits 'EditorMarker' but not
+		// 'Market'). Case-insensitive. forceCast BEATS every built-in exclusion (billboard/alpha/effect/decal/
+		// no-cast flag); forceNoCast beats casting. forceCast wins a conflict. Empty (default) = no change.
+		std::vector<std::string> forceCast;    // force these meshes TO cast a shadow
+		std::vector<std::string> forceNoCast;  // force these meshes to NOT cast a shadow
 
 		// Read the .toml (writing a documented default file if none exists) and validate the
 		// [atlas] section against the compiled constants. Safe to call once at startup.

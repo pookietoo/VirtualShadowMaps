@@ -19,6 +19,23 @@ namespace
 
 	// Serialize a Config to documented TOML text (comments + current values). Written by Save()
 	// and used for the auto-generated default so the options are discoverable in the file itself.
+	// Serialize a pattern list as a TOML array of LITERAL (single-quoted) strings, so backslashes in
+	// model paths (e.g. '\effects\') are taken verbatim — a TOML basic ("...") string would treat '\' as
+	// an escape. Patterns must not contain a single quote (none of ours do).
+	std::string ToTomlArray(const std::vector<std::string>& v)
+	{
+		std::string o = "[";
+		for (size_t i = 0; i < v.size(); ++i) {
+			if (i)
+				o += ", ";
+			o += '\'';
+			o += v[i];
+			o += '\'';
+		}
+		o += "]";
+		return o;
+	}
+
 	std::string ToToml(const vsm::Config& c)
 	{
 		return std::format(
@@ -44,6 +61,19 @@ namespace
 		    "# them (instead of being excluded). Adds a transmittance atlas. Default false (module under validation).\n"
 		    "translucentShadows = {}\n"
 		    "\n"
+		    "# Per-shape shadow-caster overrides. Match the caster's model NIF path (as a substring — use path\n"
+		    "# fragments like '\\effects\\', '\\magic\\', '\\lod\\') and/or its shape name (WHOLE-TOKEN: a name is\n"
+		    "# split on non-letters and camelCase, so 'marker' matches 'EditorMarker' but NOT 'Market'/'Moonlight').\n"
+		    "# Case-insensitive; use single-quoted strings so backslashes are literal. forceCast BEATS every\n"
+		    "# built-in exclusion (billboards, alpha/effect glass, decals, the kCastShadows-off flag); forceNoCast\n"
+		    "# beats casting; forceCast wins a conflict. Empty (default) = today's behavior exactly.\n"
+		    "# Examples (commented candidates — verify against your load order before enabling):\n"
+		    "#   forceNoCast = ['\\effects\\', '\\magic\\', '\\lod\\', 'xmarker', 'editormarker', '1stperson']\n"
+		    "#   forceCast   = ['glowingmushroom']\n"
+		    "[classification]\n"
+		    "forceCast   = {}\n"
+		    "forceNoCast = {}\n"
+		    "\n"
 		    "# [atlas] is COMPILE-TIME (baked into the shipped shader + GPU buffer sizing). Shown for\n"
 		    "# reference only; changing it here has NO effect until the plugin is rebuilt with new\n"
 		    "# values in VSMConstants.h.\n"
@@ -56,6 +86,8 @@ namespace
 		    c.cullCasters,
 		    c.incrementalCache,
 		    c.translucentShadows,
+		    ToTomlArray(c.forceCast),
+		    ToTomlArray(c.forceNoCast),
 		    vsm::kFaceRes, vsm::kMaxLights);
 	}
 }
@@ -91,6 +123,18 @@ namespace vsm
 		cullCasters        = tbl["general"]["cullCasters"].value_or(cullCasters);
 		incrementalCache   = tbl["general"]["incrementalCache"].value_or(incrementalCache);
 		translucentShadows = tbl["general"]["translucentShadows"].value_or(translucentShadows);
+
+		// [classification] pattern lists (arrays of strings). Absent section => leave empty (no override).
+		forceCast.clear();
+		forceNoCast.clear();
+		if (auto* arr = tbl["classification"]["forceCast"].as_array())
+			for (auto& el : *arr)
+				if (auto s = el.value<std::string>())
+					forceCast.push_back(*s);
+		if (auto* arr = tbl["classification"]["forceNoCast"].as_array())
+			for (auto& el : *arr)
+				if (auto s = el.value<std::string>())
+					forceNoCast.push_back(*s);
 
 		// Atlas geometry is compile-time; warn (don't apply) if the file disagrees.
 		const int faceRes   = tbl["atlas"]["faceResolution"].value_or(kFaceRes);

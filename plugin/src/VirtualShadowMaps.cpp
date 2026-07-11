@@ -7,12 +7,14 @@
 #include <DirectXPackedVector.h>  // XMConvertHalfToFloat (bone-weight halfs)
 
 #include <algorithm>
+#include <cctype>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <format>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -27,8 +29,10 @@
 #include "RE/N/NiBillboardNode.h"       // camera-facing effect planes (smoke/vapor/fire) — excluded as casters
 #include "RE/T/TESObjectREFR.h"         // light reference -> base object (identity + authored LIGH data)
 #include "RE/T/TESObjectLIGH.h"         // OBJ_LIGH: nearDistance, flags (shadow type), color, radius
+#include "RE/T/TESModel.h"              // model NIF path of a caster's base object (config pattern override)
 #include "RE/B/BSShaderProperty.h"      // EShaderPropertyFlag::kCastShadows — mirror the engine's cast flag
 #include "RE/B/BSEffectShaderProperty.h"// effect-shader geometry (emitters/FX) — not an opaque caster
+#include "RE/B/BSWaterShaderProperty.h" // water shader geometry — reflector/receiver, never a shadow caster
 #include "RE/B/BSEffectShaderMaterial.h"// A5: effect-glass baseColor (NiColorA tint + alpha) for translucent shadow tint
 #include "RE/P/PlayerCharacter.h"       // player 3D root (viewer-attached light rejection)
 #include "RE/P/PlayerCamera.h"          // camera root (viewer-attached light rejection)
@@ -128,8 +132,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	// reads garbage. Populated by UpdateDebugCB, sized via sizeof here and in SetupResources.
 	struct alignas(16) VSMDebugCB
 	{
-		float biasScale;   int mode;        float vizScale;  int sampleSpace;  // row 0 (biasScale = fShadowBiasScale x calc bias)
-		float matchThresh; int compareMode; int matchEye;    float pcfRadius;  // row 1 (pcfRadius = PCF half-width, from iBlurDeferredShadowMask)
+		float biasScale;    int mode;        float vizScale;  int sampleSpace;  // row 0 (biasScale = fShadowBiasScale x calc bias)
+		float translucentOn; int compareMode; int matchEye;   float pcfRadius;  // row 1 (translucentOn = A5 t112 live? was the dead matchThresh; pcfRadius from iBlurDeferredShadowMask)
 		float altEyeX;     float altEyeY;   float altEyeZ;   int probeArmed;   // row 2
 		float probePixelX; float probePixelY; float atlasH;  float atlasW;     // row 3 (ppad0/ppad1 -> runtime atlasH/atlasW)
 	};
@@ -213,6 +217,8 @@ void VirtualShadowMaps::PersistSettingsIfChanged()
 		return;
 	auto& cfg = vsm::GetConfig();
 	cfg.enabled = enabled;
+	VSM_LOG("VSM modules: enabled={} cacheStaticShadows={} incrementalCache={} cullCasters={} translucentShadows={} qualityFactor={:.2f}",
+	    cfg.enabled, cfg.cacheStaticShadows, cfg.incrementalCache, cfg.cullCasters, cfg.translucentShadows, cfg.qualityFactor);
 	cfg.Save();
 	settingsDirty = false;
 }
@@ -1121,9 +1127,12 @@ void VirtualShadowMaps::UpdateDebugCB()
 	// (0,0,1) and mis-places the atlas. Space 2 samples with P + altEye for comparison.
 	const RE::NiPoint3 eye{ sceneCameraPos.x, sceneCameraPos.y, sceneCameraPos.z };
 
+	// A5 gate: the shader samples/multiplies the t112 transmittance ONLY when this is 1 — so with the module OFF
+	// (default), local lights never depend on t112 being bound (an unbound t112 samples black and would zero them).
+	const float translucentOn = vsm::GetConfig().translucentShadows ? 1.0f : 0.0f;
 	const VSMDebugCB cb{
 		rtBiasScale, dbgMode, dbgVizScale, dbgSampleSpace,   // row 0 (biasScale = fShadowBiasScale multiplier on the calc bias)
-		vsm::kDebugModeMatchThresh, dbgCompareMode, dbgMatchEye, (float)rtPCFRadius,  // row 1 (pcfRadius = PCF half-width from iBlurDeferredShadowMask)
+		translucentOn, dbgCompareMode, dbgMatchEye, (float)rtPCFRadius,  // row 1 (translucentOn = A5 t112 live?; pcfRadius = PCF half-width from iBlurDeferredShadowMask)
 		eye.x, eye.y, eye.z, probeArmed ? 1 : 0,             // row 2 (probeArmed -> write pixel probe to u8)
 		probeFracX * screenW, probeFracY * screenH, (float)rtAtlasH, (float)rtAtlasW,  // row 3 (ppad0/1 -> atlasH/atlasW)
 	};
@@ -1185,6 +1194,7 @@ void VirtualShadowMaps::RebuildRegistrySafe(RE::NiAVObject* a_obj)
 		registrySeen.clear();
 		rejectedNoRenderData = rejectedNoVertexBuffer = rejectedNoIndexBuffer = rejectedZeroTriangles = rejectedDuplicate = 0;
 		rejectedHidden = rejectedTransparent = rejectedNoCast = rejectedDecal = rejectedBillboard = 0;
+		rejectedUserNoCast = userForcedCast = rejectedNotVisible = rejectedEngineFlag = 0;
 		RebuildRegistry(a_obj, 0);   // ShadowSceneNode (sky/LOD skipped) — mostly sky in interiors
 		RebuildFromReferences();     // player + loaded-cell references: room shell, clutter, NPCs, player
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1263,6 +1273,97 @@ static void ReadTranslucentMaterial(RE::BSShaderProperty* a_prop, float& a_cover
 	}
 }
 
+// -----------------------------------------------------------------------------------------------
+// Config pattern override (config.forceCast / forceNoCast) — per-shape shadow-caster whitelist/blacklist.
+// The NIF itself carries the engine's cast intent (kCastShadows etc., handled below); these let a USER
+// force specific meshes to cast (beating every built-in exclusion) or never cast, by matching the
+// caster's model NIF PATH (substring, e.g. '\effects\') and shape NAME (WHOLE-TOKEN, so 'marker' hits
+// 'EditorMarker' but not 'Market'/'Moonlight'). Research found no other mod does runtime pattern-based
+// shadow classification — this is the user escape hatch for the cases flags miss.
+// -----------------------------------------------------------------------------------------------
+
+// Lowercase + normalize '/'->'\' so path patterns match regardless of separator/case.
+static std::string VsmNormalize(std::string_view a_s)
+{
+	std::string o;
+	o.reserve(a_s.size());
+	for (char c : a_s)
+		o.push_back(c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+	return o;
+}
+
+// Split a shape name into lowercased alphanumeric tokens, breaking on non-alnum AND camelCase
+// (lower->upper) boundaries. 'EditorMarker' -> {editor, marker}; 'Plane03' -> {plane03}.
+static void VsmTokenizeName(std::string_view a_name, std::vector<std::string>& a_out)
+{
+	std::string cur;
+	auto flush = [&] {
+		if (!cur.empty()) {
+			a_out.push_back(cur);
+			cur.clear();
+		}
+	};
+	for (size_t i = 0; i < a_name.size(); ++i) {
+		const unsigned char c = static_cast<unsigned char>(a_name[i]);
+		if (!std::isalnum(c)) {
+			flush();
+			continue;
+		}
+		if (i > 0 && std::isupper(c) && std::islower(static_cast<unsigned char>(a_name[i - 1])))
+			flush();  // camelCase boundary
+		cur.push_back(static_cast<char>(std::tolower(c)));
+	}
+	flush();
+}
+
+// A pattern hits if it's a substring of the normalized path OR equals a whole name token.
+static bool VsmPatternHits(const std::vector<std::string>& a_pats, const std::string& a_pathLower,
+    const std::vector<std::string>& a_nameToks)
+{
+	for (const auto& p : a_pats) {
+		if (p.empty())
+			continue;
+		const std::string pl = VsmNormalize(p);
+		if (!a_pathLower.empty() && a_pathLower.find(pl) != std::string::npos)
+			return true;
+		for (const auto& t : a_nameToks)
+			if (t == pl)
+				return true;
+	}
+	return false;
+}
+
+// The model NIF path of a caster's owning reference (per-ref; all shapes in the NIF share it).
+static std::string VsmModelPath(RE::FormID a_owner)
+{
+	if (!a_owner)
+		return {};
+	if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(a_owner))
+		if (auto* base = ref->GetBaseObject())
+			if (auto* m = skyrim_cast<RE::TESModel*>(base))
+				if (const char* mp = m->GetModel())
+					return mp;
+	return {};
+}
+
+// Per-shape verdict from the user patterns: +1 force-cast, -1 force-no-cast, 0 no override.
+// Short-circuits to 0 (skips the model-path lookup) when both lists are empty, so it's free when unused.
+static int VsmPatternVerdict(RE::FormID a_owner, const char* a_shapeName)
+{
+	const auto& cfg = vsm::GetConfig();
+	if (cfg.forceCast.empty() && cfg.forceNoCast.empty())
+		return 0;
+	std::vector<std::string> toks;
+	if (a_shapeName)
+		VsmTokenizeName(a_shapeName, toks);
+	const std::string pathLower = VsmNormalize(VsmModelPath(a_owner));
+	if (VsmPatternHits(cfg.forceCast, pathLower, toks))
+		return 1;  // force-cast wins over force-no-cast on a conflict
+	if (VsmPatternHits(cfg.forceNoCast, pathLower, toks))
+		return -1;
+	return 0;
+}
+
 void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::FormID a_owner, bool a_underBillboard)
 {
 	if (!a_obj || a_depth > vsm::kMaxSceneGraphDepth)  // depth cap guards against scene-graph cycles
@@ -1324,13 +1425,61 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::
 		// CastShadows bit, and the prime suspect for the flat hearth 'Plane03' bars.
 		const bool decal = geoRt.shaderProperty &&
 		    (geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kDecal) ||
-		     geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kDynamicDecal));
+		     geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kDynamicDecal) ||
+		     geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kProjectedUV) ||   // projected-UV decal
+		     geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kWeaponBlood));     // weapon-blood overlay
 		// Two-sided material: must rasterize with CULL_NONE so the away-facing side still casts (else a
 		// plane pointing away from the light writes no atlas depth — the confirmed Plane03 missing shadow).
 		const bool twoSided = geoRt.shaderProperty &&
 		    geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kTwoSided);
-		if (underBillboard) {
+		// --- Additional engine "don't cast" signals (research-derived; see notes/VSM_SHADOW_CLASSIFICATION_
+		// RESEARCH.md). The vanilla shadow pass also omits geometry carrying these shader flags / of the water
+		// type / flagged not-visible, so we mirror it and stop casting shadows the game itself never casts.
+		using SPF = RE::BSShaderProperty::EShaderPropertyFlag;
+		auto spHas = [sp = geoRt.shaderProperty.get()](SPF f) { return sp && sp->flags.any(f); };
+		const bool engineNoCastFlag =
+		    spHas(SPF::kNonProjectiveShadows) ||  // explicitly excluded from projected shadow maps
+		    spHas(SPF::kBillboard)            ||  // billboard shader (backup to the NiBillboardNode check)
+		    spHas(SPF::kWireframe)            ||  // wireframe (particles)
+		    spHas(SPF::kLODObjects)           ||  // object-LOD proxy geometry
+		    spHas(SPF::kLODLandscape)         ||  // landscape-LOD geometry
+		    spHas(SPF::kHDLODObjects);            // HD object-LOD geometry
+		// Water is its own shader type (reflector/receiver) — never a shadow caster.
+		const bool isWater = geoRt.shaderProperty &&
+		    netimmerse_cast<RE::BSWaterShaderProperty*>(geoRt.shaderProperty.get()) != nullptr;
+		// Invisible in-game via the runtime NiAVObject flag (distinct from kHidden/app-cull, skipped at the top
+		// of RebuildRegistry): the engine doesn't draw OR cast it. Prime suspect for the reported "invisible
+		// mesh casting a shadow on characters" — a mesh hidden this way but with kCastShadows still on.
+		const bool notVisible = a_obj->GetFlags().any(RE::NiAVObject::Flag::kNotVisible);
+		// Config pattern override (per-shape). Checked FIRST: forceCast beats every built-in exclusion below,
+		// forceNoCast beats casting. Free (no path lookup) unless the user set patterns.
+		const int patternVerdict = VsmPatternVerdict(a_owner, a_obj->name.c_str());
+		if (patternVerdict < 0) {
+			++rejectedUserNoCast;                            // user forceNoCast: never cast this mesh
+		} else if (patternVerdict > 0) {
+			// User forceCast: capture as an OPAQUE caster regardless of billboard/alpha/effect/decal/no-cast
+			// flags. Uses the buffer path when the shape has renderer buffers, else the engine-only path.
+			if (registrySeen.insert(static_cast<RE::BSGeometry*>(tri)).second) {
+				CasterEntry e;
+				e.geom     = RE::NiPointer<RE::BSGeometry>(tri);
+				e.twoSided = twoSided;
+				e.ownerRef = a_owner;
+				if (rd && rd->vertexBuffer && rd->indexBuffer && triCount) {
+					e.vertexStride = rd->vertexDesc.GetSize();
+					e.indexCount   = triCount * 3u;
+					e.isStatic     = IsCasterStatic(tri, a_owner);
+				} else {
+					e.engineOnly = true;                     // no buffers -> engine draw path (skinned/dynamic)
+				}
+				registry.push_back(std::move(e));
+				++userForcedCast;
+			} else {
+				++rejectedDuplicate;
+			}
+		} else if (underBillboard) {
 			++rejectedBillboard;
+		} else if (notVisible) {
+			++rejectedNotVisible;                            // engine flag: invisible in-game -> don't cast
 		} else if (transparent) {
 			// A5: instead of discarding glass/alpha geometry, capture it as a TRANSLUCENT caster — it renders into
 			// the transmittance atlas to DIM/TINT the light rather than block it. v1 captures clean static-ish glass
@@ -1358,6 +1507,8 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::
 			++rejectedDecal;
 		} else if (noCast) {
 			++rejectedNoCast;
+		} else if (engineNoCastFlag || isWater) {
+			++rejectedEngineFlag;                            // nonProjective/billboard/wireframe/LOD/water -> engine omits
 		} else if (!rd) {
 			// No renderer buffers = skinned/dynamic geometry (the character body/head/armor). Our
 			// custom depth VS can't draw it, but the ENGINE path (BSUtilityShader) can — it draws from
@@ -1480,20 +1631,24 @@ static void VSM_SkinOneCaster(RE::BSGeometry* a_g, DirectX::XMFLOAT3* a_posed, s
 	}
 }
 
-// Path B1 — head / hair / face (BSDynamicTriShape). Unlike the body (a GPU-skinned BSTriShape we skin
-// ourselves from bind pose + bone palette), the engine has ALREADY CPU-skinned these every frame into
-// `dynamicData`: a flat array of skinPartition->vertexCount posed positions in the geometry's LOCAL
-// space, float4 (16-byte stride, xyz + w). Verified from dumped bytes — for every dynamic mesh
-// dataSize == vertexCount * 16 exactly, and the byte at offset 12 of vertex 0 reads 0.0 (the w term).
-// So we skip re-skinning and just transform each posed local vertex by geom->world (world-absolute
-// here, exactly like the statics) into the SAME shared posed buffer, indexed identically to
-// VSM_SkinOneCaster (partition-local triList + partBase). vertexMap turns a partition-local index into
-// the global dynamicData index. SEH-isolated, POD-only locals, bounds-checked — a torn-down streaming
-// mesh faults here and is caught, leaving partial-but-safe results.
-static void VSM_PosedDynamicCaster(RE::BSGeometry* a_g, const DirectX::XMFLOAT4X4& a_world,
+// Path B1 — head / hair / face (BSDynamicTriShape). The engine writes CPU-MORPHED (facegen/expression)
+// model-space positions into `dynamicData` every frame (float4, 16-byte stride, xyz + w=0; dataSize ==
+// skinPartition->vertexCount * 16), but it is NOT yet skinned — a skinned mesh is placed by the BONE
+// PALETTE, not by geom->world. Applying geom->world to unskinned local verts left heads ~10x oversized
+// (adults) and scattered ~2380u (children — the character's world placement + scale live in the bones,
+// which we were skipping). So we skin `dynamicData` through the same bone palette as the body path
+// (VSM_SkinOneCaster) — the ONLY difference is the bind POSITION comes from dynamicData in DRAW order
+// (a running per-partition base + lv; dynamicData is concatenated per partition, NOT shape-vertex order —
+// see the partition loop) instead of the vertex buffer's VA_POSITION, while the WEIGHTS/bone-slots come
+// from the partition's own vertex stream at partition-local lv (VA_SKINNING). Output is WORLD-absolute;
+// NO geom->world multiply. SEH-isolated, POD-only locals, bounds-checked. (dynamicData is pre-skin
+// model space — the pre-0.9.91 "already CPU-skinned, transform by geom->world" assumption was wrong.)
+static void VSM_PosedDynamicCaster(RE::BSGeometry* a_g,
     DirectX::XMFLOAT3* a_posed, std::uint32_t* a_idx, std::uint32_t a_maxV, std::uint32_t a_maxI,
     std::uint32_t& a_vCount, std::uint32_t& a_iCount)
 {
+	using namespace DirectX::PackedVector;
+	using V = RE::BSGraphics::Vertex;
 	__try {
 		auto* dts = a_g->AsDynamicTriShape();
 		if (!dts)
@@ -1504,31 +1659,79 @@ static void VSM_PosedDynamicCaster(RE::BSGeometry* a_g, const DirectX::XMFLOAT4X
 		if (!dyn || dynSize < 16)
 			return;
 		auto* skin = a_g->GetGeometryRuntimeData().skinInstance.get();
-		if (!skin || !skin->skinPartition)
+		if (!skin || !skin->boneMatrices || !skin->skinPartition || skin->numMatrices == 0)
 			return;
 		auto* sp = skin->skinPartition.get();
-		constexpr std::uint32_t kDynStride  = 16;  // float4 posed pos (xyz + w=0); verified from dumped bytes
+		const float* boneMats = reinterpret_cast<const float*>(skin->boneMatrices);
+		const std::uint16_t numMats = static_cast<std::uint16_t>(skin->numMatrices);       // palette size (bounds guard)
+		const int matStrideF = static_cast<int>(skin->allocatedSize / skin->numMatrices) / static_cast<int>(sizeof(float));  // 12 floats = 3x4
+		if (matStrideF < 12)
+			return;
+		constexpr std::uint32_t kDynStride  = 16;  // float4 morphed model-space pos (xyz + w=0)
 		const std::uint32_t dynVertCount = dynSize / kDynStride;
 		if (dynVertCount == 0 || dynVertCount != sp->vertexCount)
 			return;  // layout we don't recognise — skip rather than risk an out-of-bounds read
-		const DirectX::XMMATRIX world = DirectX::XMLoadFloat4x4(&a_world);
+		// dynamicData is CONCATENATED in partition/draw order (each partition's compacted verts, seam verts
+		// duplicated), so dataSize/16 == sp->vertexCount == the UNIQUE count (partitions SHARE seam verts, so sum p.vertices >= unique); dynamicData AND every partition's buffData are ONE shared global buffer, indexed by vertexMap[lv]. [old note kept for context]: — NOT the shape-unique count. The
+		// bind position is indexed by a RUNNING draw-order counter, NOT vertexMap (which maps to the shape's
+		// ORIGINAL vertex order and coincides with draw order only for a SINGLE partition — the reason the
+		// explosion was 100% correlated with numPartitions>1).
+		std::uint32_t dynBase = 0;
 		for (std::uint32_t pi = 0; pi < sp->numPartitions; ++pi) {
 			auto& p = sp->partitions[pi];
-			if (!p.triList || !p.vertexMap)
+			const std::uint32_t thisBase = dynBase;  // this partition's slice start in dynamicData
+			dynBase += p.vertices;                   // advance for EVERY partition (even skipped) to stay aligned
+			auto* bd = p.buffData;
+			if (!bd || !bd->rawVertexData || !p.triList || !p.bones)
 				continue;
-			const std::uint32_t partBase = a_vCount;  // this partition's first vert in the global buffer
+			auto& vd = p.vertexDesc;
+			const std::uint32_t stride  = vd.GetSize();
+			const std::uint32_t skinOff = vd.GetAttributeOffset(V::VA_SKINNING);
+			// Only the SKINNING block is read from this stream (position comes from dynamicData): 4 weight
+			// halfs (8B) + 4 bone-index bytes (4B) = 12 bytes. POSITION is NOT here (split dynamic stream).
+			const size_t kSkinBlockBytes = 4 * sizeof(std::uint16_t) + 4 * sizeof(std::uint8_t);  // 12
+			if (!vd.HasFlag(V::VF_SKINNED) || skinOff + kSkinBlockBytes > stride)
+				continue;
+			const std::uint8_t* rv = reinterpret_cast<const std::uint8_t*>(bd->rawVertexData);
+			const std::uint16_t* remap = p.bones;              // partition-local bone slot -> global palette index
+			const std::uint32_t partBase = a_vCount;           // this partition's first vert in the global buffer
 			for (std::uint16_t lv = 0; lv < p.vertices; ++lv) {
 				if (a_vCount >= a_maxV)
 					return;
-				const std::uint16_t gv = p.vertexMap[lv];  // partition-local -> global dynamicData index
-				if (gv >= dynVertCount) {
-					a_posed[a_vCount++] = { 0.0f, 0.0f, 0.0f };
-					continue;
+				// Bind position from dynamicData indexed by vertexMap (partition-local -> shape-UNIQUE index).
+				// dynamicData is unique-count (dataSize/16 == sp->vertexCount); partitions SHARE seam verts
+				// (sum p.vertices > unique), so a running draw-order counter reads the fragile DUPLICATE seam
+				// tail (dyn[sumPrior + lv]) which the runtime mis-reads -> the 2nd-partition explosion. vertexMap
+				// maps into the reliably-populated unique region only. Offline-validated against the runtime p0
+				// (exact match) to give a coherent head for BOTH partitions. Falls back to the running counter
+				// only if vertexMap is somehow absent (single-partition meshes have an identity map anyway).
+				const std::uint32_t dynIdx = p.vertexMap ? p.vertexMap[lv] : (thisBase + lv);
+				float bx = 0.0f, by = 0.0f, bz = 0.0f;
+				if (dynIdx >= dynVertCount) { a_posed[a_vCount++] = { 0.0f, 0.0f, 0.0f }; continue; }  /* OOB of shared buffer */ {
+					const float* lp = reinterpret_cast<const float*>(dyn + static_cast<size_t>(dynIdx) * kDynStride);
+					bx = lp[0]; by = lp[1]; bz = lp[2];
+				}  // else bindPos stays 0 -> skins to the weighted bone origins (near the actor, not world (0,0,0))
+				// Weights + bone slots: from the shared global vertex buffer at the SAME global index as the position.
+				const std::uint8_t* vb = rv + static_cast<size_t>(dynIdx) * stride;  // GLOBAL index (buffData is one shared global buffer), SAME as position
+				const std::uint16_t* w  = reinterpret_cast<const std::uint16_t*>(vb + skinOff);
+				const std::uint8_t*  ib = reinterpret_cast<const std::uint8_t*>(vb + skinOff + 4 * sizeof(std::uint16_t));
+				float wx = 0.0f, wy = 0.0f, wz = 0.0f;
+				for (int b = 0; b < 4; ++b) {
+					const float wt = XMConvertHalfToFloat(w[b]);
+					if (wt <= 0.0f)
+						continue;
+					const std::uint16_t li = ib[b];   // partition-local bone slot
+					if (li >= p.numBones)
+						continue;
+					const std::uint16_t gi = remap[li];  // -> global palette index
+					if (gi >= numMats)
+						continue;
+					const float* M = boneMats + static_cast<size_t>(gi) * matStrideF;  // 3x4 row-major, skin->world
+					wx += wt * (M[0] * bx + M[1] * by + M[2] * bz + M[3]);
+					wy += wt * (M[4] * bx + M[5] * by + M[6] * bz + M[7]);
+					wz += wt * (M[8] * bx + M[9] * by + M[10] * bz + M[11]);
 				}
-				const float* lp = reinterpret_cast<const float*>(dyn + static_cast<size_t>(gv) * kDynStride);
-				DirectX::XMFLOAT3 wp;
-				DirectX::XMStoreFloat3(&wp, DirectX::XMVector3TransformCoord(DirectX::XMVectorSet(lp[0], lp[1], lp[2], 1.0f), world));
-				a_posed[a_vCount++] = wp;
+				a_posed[a_vCount++] = { wx, wy, wz };  // WORLD-absolute (palette folds skin->world); no geom->world
 			}
 			const std::uint16_t* tl = p.triList;
 			const std::uint32_t nidx = static_cast<std::uint32_t>(p.triangles) * 3u;
@@ -1573,9 +1776,13 @@ void VirtualShadowMaps::SkinAllCasters()
 		// into dynamicData — transform-only (Path B1). Everything else is a GPU-skinned BSTriShape we
 		// skin ourselves from bind pose + bone palette (Path B).
 		if (auto* dts = g->AsDynamicTriShape(); dts && dts->GetDynamicTrishapeRuntimeData().dynamicData) {
-			DirectX::XMFLOAT4X4 w;
-			DirectX::XMStoreFloat4x4(&w, NiTransformToXM(g->world));
-			VSM_PosedDynamicCaster(g, w, skinPosed.data(), skinIndices.data(), kMaxSkinVerts, kMaxSkinIdx, vCount, iCount);
+			// The engine writes dynamicData (facegen/expression/morph) asynchronously and guards every access
+			// with this spinlock. Reading it unlocked races the writer -> torn positions in the seam/duplicate
+			// region -> live-only head explosions (offline dumps read settled data, so they looked coherent).
+			auto& dr = dts->GetDynamicTrishapeRuntimeData();
+			dr.lock.Lock();
+			VSM_PosedDynamicCaster(g, skinPosed.data(), skinIndices.data(), kMaxSkinVerts, kMaxSkinIdx, vCount, iCount);
+			dr.lock.Unlock();
 		} else {
 			VSM_SkinOneCaster(g, skinPosed.data(), skinIndices.data(), kMaxSkinVerts, kMaxSkinIdx, vCount, iCount);
 		}

@@ -46,6 +46,12 @@ public:
 	void        DumpDiagnosticLog();    // full numeric shadow-math dump (+ atlas/id/geom sidecars)
 	void        DumpSkinnedGeometry();  // Path B probe: what skinned-mesh buffers/data exist at Present
 	void        DumpGeometry();         // every caster's REAL world-space triangles -> geom.bin sidecar
+	void        DumpSkinningFull();     // COMPLETE skinning state (palette, dynamicData, per-partition bones/maps/
+	                                    // weights/slots/positions) for every skinned caster -> skin.bin sidecar
+	void        DumpSceneFull();        // EVERYTHING in the scene graph: every node's transforms/flags/bounds/
+	                                    // hierarchy + every geometry's staged GPU buffers, properties, dynamicData,
+	                                    // and FULL skin (palette, bone-world-xforms, inverse-binds, all partition
+	                                    // arrays incl. p.weights/p.bonePalette) -> scene.bin sidecar
 	void        DumpFocusedCaster(int a_idx);  // full render+projection detail for one caster (flashed/isolated)
 	void        DumpSceneCensus(RE::NiAVObject* a_root, const char* a_label);  // SEH-guarded scene-graph census
 	void        DumpPlayerDiag(RE::NiAVObject* a_p3d);                          // player geometry + registry membership

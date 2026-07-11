@@ -22,6 +22,8 @@ namespace VSM
 	static const float kArgMinInit  = 1e30;  // initial best-distance for the nearest-light argmin
 		static const float kRadiusFadeBand = 0.12;  // A1: fade the shadow toward lit over the outer 12% of the light's radius (far
 		                                            // plane), so it vanishes with the light's own falloff instead of a hard circular cutoff.
+		static const float kDebugMatchThresh = 5.0; // debug mode 16 ONLY: nearest-light match distance threshold (was the b13
+		                                            // gMatchThresh field, now repurposed as gTranslucentOn).
 	static const int   kMaxPCFRadius = 4;    // clamp cap for the runtime soft-shadow PCF half-width (gPCFRadius, from
 	                                         // iBlurDeferredShadowMask). Fixed texels x per-light faceRes = constant screen penumbra.
 
@@ -53,8 +55,8 @@ namespace VSM
 		                     //    1 = off(lit), 2..22 = RGB diagnostic overlay, 23/24/25 = shadow-tint (not overlays)
 		float gVizScale;     // 8  grayscale scale for the atlas-depth views (debug)
 		int   gSampleSpace;  // 12 0 = absP(CameraPosAdjust)  1 = P(cam-rel)  2 = P + altEye
-		float gMatchThresh;  // 16 LEGACY match threshold — UNUSED by the real match (now threshold-free nearest-light);
-		                     //    only debug mode 16 still reads it
+		float gTranslucentOn;// 16 A5: 1 = the transmittance atlas (t112) is live -> sample + tint the light; 0 (default) =
+		                     //    skip it entirely, so local lights NEVER depend on t112 being bound. (Was the dead gMatchThresh.)
 		int   gCompareMode;  // 20 0 = linearized-distance compare  1 = raw ndc.z compare
 		int   gMatchEye;     // 24 0 = CameraPosAdjust  1 = altEye(posAdjust.getEye) — eye for lightPosWS match
 		float gPCFRadius;    // 28 soft-shadow PCF kernel half-width in texels (from iBlurDeferredShadowMask; 0 = hard). Was gFaceRes (now per-light in positionWS.w)
@@ -241,8 +243,11 @@ namespace VSM
 						atlasUV       = pxc / float2(gAtlasW, gAtlasH);
 						occluder      = ShadowAtlas.SampleLevel(ShadowSampler, atlasUV, 0);
 						// A5: colored transmittance of any glass/alpha caster in front of the opaque occluder along this
-						// texel's ray (white when the A5 module is off). Multiplies the local light in Lighting.hlsl.
-						transmittance = ShadowTransAtlas.SampleLevel(ShadowSampler, atlasUV, 0).rgb;
+						// texel's ray. Sampled ONLY when the module is live (gTranslucentOn) — otherwise transmittance stays
+						// white, so a local light NEVER depends on t112 being bound (an unbound t112 samples black and would
+						// zero the light). Multiplies the local light in Lighting.hlsl.
+						if (gTranslucentOn > 0.5)
+							transmittance = ShadowTransAtlas.SampleLevel(ShadowSampler, atlasUV, 0).rgb;
 						if (gCompareMode == 1) {
 							shadow = (occluder - ndc.z > 0.0) ? 0.0 : 1.0;   // raw compare (isolates linearize); reverse-Z: occluder nearer (larger z) than receiver = shadowed
 						} else {
@@ -421,7 +426,7 @@ namespace VSM
 		if (gMode == 13) return saturate(linOcc / gVizScale).xxx;                   // occluder distance
 		if (gMode == 14) return saturate(linPix / gVizScale).xxx;                   // pixel distance from the light
 		if (gMode == 15) return (linPix - linOcc > gBiasScale) ? float3(1,0,0) : float3(0,1,0);  // legacy rough decision vs gBiasScale (NOT the calculated-bias path); red=shadow
-		if (gMode == 16) return bestD < gMatchThresh ? float3(0,1,0) : float3(1, saturate(bestD / 500.0), 0);  // LEGACY (gMatchThresh unused by the real nearest-light match); green=matched
+		if (gMode == 16) return bestD < kDebugMatchThresh ? float3(0,1,0) : float3(1, saturate(bestD / 500.0), 0);  // LEGACY match viz (green=within threshold of nearest light)
 		if (gMode == 17) return frac(float3(best * 0.1237, best * 0.3391, best * 0.5541) + 0.11);      // matched light index color
 		if (gMode == 19) return (occluder > 0.0001) ? float3(0,1,0) : float3(0.2,0,0);  // atlas populated where we sample? reverse-Z: green=depth>0 (empty=0)
 		if (gMode == 20) return (occluder - ndc.z > 0.0) ? float3(1,0,0) : float3(0,1,0);  // raw-depth shadow decision (no linearize); reverse-Z

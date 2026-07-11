@@ -21,7 +21,9 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
@@ -43,6 +45,10 @@
 #include "RE/T/TESModel.h"             // mesh/NIF path of a ref's base object
 #include "RE/T/TESObjectCELL.h"        // parent cell formID
 #include "RE/N/NiAVObject.h"           // parent-chain walk for a light's owning ref
+#include "RE/N/NiNode.h"               // GetChildren() for the full scene-graph walk
+#include "RE/B/BSShaderManager.h"      // shadowSceneNode[] roots (full scene dump)
+#include "RE/B/BSEffectShaderProperty.h"  // effect-shader detection (full scene dump)
+#include "RE/P/PlayerCharacter.h"      // player 3D + parent cell references (full scene dump)
 #include "RE/E/ExtraEnableStateParent.h"  // enable-parent link between separate refs
 
 using namespace DirectX;
@@ -682,6 +688,348 @@ void VsmDiagnostics::DumpGeometry()
 	    nC, nSkin, totV, totT);
 }
 
+// COMPLETE SKINNING STATE DUMP — for every caster with a skin instance, write EVERYTHING the CPU/GPU holds
+// that determines its posed vertices, to a binary sidecar (skin.bin), so the full skinning can be reproduced
+// and diagnosed OFFLINE with zero further captures: the whole bone-matrix PALETTE, the whole dynamicData
+// (morphed model-space positions), and per partition the bones remap, vertexMap, triList, and per-vertex raw
+// weights+bone-slots+buffData position. All the referenced buffers (skin->boneMatrices, dynamicData,
+// partition buffData->rawVertexData, bones/vertexMap/triList) are CPU-readable at Present (the skinned probe
+// already reads them directly). Also logs a readable per-caster summary + the Σ p.vertices==dataSize/16 check.
+void VsmDiagnostics::DumpSkinningFull()
+{
+	using namespace DirectX;
+	using V = RE::BSGraphics::Vertex;
+	auto& registry = m_core.registry;
+	if (registry.empty())
+		return;
+	auto dir = logger::log_directory();
+	if (!dir)
+		return;
+	std::ofstream sf(*dir / "VirtualShadowMaps_skin.bin", std::ios::binary | std::ios::trunc);
+	if (!sf) {
+		logger::warn("VSM skin dump: cannot open skin.bin");
+		return;
+	}
+	auto wr = [&sf](const void* p, size_t n) { sf.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); };
+	auto wu32 = [&](std::uint32_t v) { wr(&v, 4); };
+	auto wu16 = [&](std::uint16_t v) { wr(&v, 2); };
+
+	logger::info("=== FULL SKINNING DUMP -> VirtualShadowMaps_skin.bin  (per record LE: u32 MAGIC='SKIN', u32 regIdx, u32 isDynamic, "
+	             "char[64] name, f32[16] worldMat, f32[4] boundC+r, u32 numMats,u32 matFloats, f32[numMats*matFloats] palette, "
+	             "u32 dynVerts, f32[dynVerts*3] dynamicData, u32 numParts, [u16 verts,tris,numBones,strips; u32 stride,skinOff,posOff,"
+	             "vdFlags,fullprec; u16[numBones] bones; u16[verts] vertexMap; u16[tris*3] triList; per-vert(u16[4] wHalf,u8[4] slot,"
+	             "f32[3] bufPos)]xnumParts) ===");
+
+	std::uint32_t nRec = 0;
+	for (std::uint32_t ri = 0; ri < registry.size(); ++ri) {
+		RE::BSGeometry* g = registry[ri].geom.get();
+		if (!g)
+			continue;
+		auto* skin = g->GetGeometryRuntimeData().skinInstance.get();
+		if (!skin || !skin->skinPartition || !skin->boneMatrices || skin->numMatrices == 0)
+			continue;  // not a skinned caster
+		{
+			auto* sp = skin->skinPartition.get();
+			auto* dts = g->AsDynamicTriShape();
+			const bool isDyn = dts != nullptr;
+			const std::uint8_t* dyn = isDyn ? reinterpret_cast<const std::uint8_t*>(dts->GetDynamicTrishapeRuntimeData().dynamicData) : nullptr;
+			const std::uint32_t dynSize = isDyn ? dts->GetDynamicTrishapeRuntimeData().dataSize : 0u;
+			const std::uint32_t dynVerts = (dyn && dynSize >= 16) ? dynSize / 16u : 0u;
+			const std::uint32_t numMats = skin->numMatrices;
+			const std::uint32_t matFloats = (skin->allocatedSize / numMats) / static_cast<std::uint32_t>(sizeof(float));
+			const float* pal = reinterpret_cast<const float*>(skin->boneMatrices);
+
+			// --- record header ---
+			wu32(0x4E494B53);  // 'SKIN' LE
+			wu32(ri);
+			wu32(isDyn ? 1u : 0u);
+			char nm[64]{};
+			std::strncpy(nm, g->name.c_str() ? g->name.c_str() : "", sizeof(nm) - 1);
+			wr(nm, sizeof(nm));
+			XMFLOAT4X4 wm; XMStoreFloat4x4(&wm, NiTransformToXM(g->world));
+			wr(&wm, sizeof(wm));
+			const float bc[4]{ g->worldBound.center.x, g->worldBound.center.y, g->worldBound.center.z, g->worldBound.radius };
+			wr(bc, sizeof(bc));
+			// --- full bone palette ---
+			wu32(numMats); wu32(matFloats);
+			wr(pal, static_cast<size_t>(numMats) * matFloats * sizeof(float));
+			// --- full dynamicData (morphed model-space positions) ---
+			wu32(dynVerts);
+			for (std::uint32_t v = 0; v < dynVerts; ++v) {
+				const float* lp = reinterpret_cast<const float*>(dyn + static_cast<size_t>(v) * 16u);
+				const float xyz[3]{ lp[0], lp[1], lp[2] };
+				wr(xyz, sizeof(xyz));
+			}
+			// --- per-partition full state ---
+			wu32(sp->numPartitions);
+			std::uint32_t sumVerts = 0;
+			for (std::uint32_t pi = 0; pi < sp->numPartitions; ++pi) {
+				auto& p = sp->partitions[pi];
+				auto& vd = p.vertexDesc;
+				const std::uint32_t stride = vd.GetSize();
+				const std::uint32_t skinOff = vd.GetAttributeOffset(V::VA_SKINNING);
+				const std::uint32_t posOff  = vd.GetAttributeOffset(V::VA_POSITION);
+				sumVerts += p.vertices;
+				wu16(p.vertices); wu16(p.triangles); wu16(p.numBones); wu16(p.strips);
+				wu32(stride); wu32(skinOff); wu32(posOff);
+				wu32(static_cast<std::uint32_t>(vd.GetFlags())); wu32(vd.HasFlag(V::VF_FULLPREC) ? 1u : 0u);
+				for (std::uint16_t b = 0; b < p.numBones; ++b) wu16(p.bones ? p.bones[b] : 0xFFFFu);
+				for (std::uint16_t lv = 0; lv < p.vertices; ++lv) wu16(p.vertexMap ? p.vertexMap[lv] : 0xFFFFu);
+				for (std::uint32_t k = 0; k < static_cast<std::uint32_t>(p.triangles) * 3u; ++k) wu16(p.triList ? p.triList[k] : 0u);
+				const std::uint8_t* rv = p.buffData ? reinterpret_cast<const std::uint8_t*>(p.buffData->rawVertexData) : nullptr;
+				for (std::uint16_t lv = 0; lv < p.vertices; ++lv) {
+					std::uint16_t wh[4]{}; std::uint8_t slot[4]{}; float bp[3]{};
+					if (rv && stride) {
+						const std::uint8_t* vb = rv + static_cast<size_t>(lv) * stride;
+						if (skinOff + 12 <= stride) {
+							std::memcpy(wh, vb + skinOff, 8);
+							std::memcpy(slot, vb + skinOff + 8, 4);
+						}
+						if (posOff + 12 <= stride)
+							std::memcpy(bp, vb + posOff, 12);
+					}
+					wr(wh, sizeof(wh)); wr(slot, sizeof(slot)); wr(bp, sizeof(bp));
+				}
+			}
+			// --- readable summary + the layout sanity check ---
+			logger::info("  skinFULL[{}] '{}' dyn={} parts={} dynVerts={} sumPartVerts={} spVertexCount={} {} numMats={} matFloats={}",
+			    ri, nm, isDyn ? 1 : 0, sp->numPartitions, dynVerts, sumVerts, sp->vertexCount,
+			    (dynVerts == sumVerts) ? "[sum==dynVerts OK]" : "[MISMATCH!]", numMats, matFloats);
+			for (std::uint32_t pi = 0; pi < sp->numPartitions; ++pi) {
+				auto& p = sp->partitions[pi];
+				std::string bones;
+				for (std::uint16_t b = 0; b < p.numBones && b < 32; ++b)
+					bones += std::format("{} ", p.bones ? p.bones[b] : 0xFFFF);
+				logger::info("      p{} verts={} tris={} numBones={} bones[0..{}]={} {}",
+				    pi, p.vertices, p.triangles, p.numBones, (std::min<int>)(p.numBones, 32) - 1, bones,
+				    (p.numBones > 0 && p.bones && p.bones[0] == 0 && (p.numBones < 2 || p.bones[1] == 1)) ? "(looks identity-ish)" : "(NON-identity remap)");
+			}
+			++nRec;
+		}
+	}
+	logger::info("=== FULL SKINNING DUMP: wrote {} skinned casters to skin.bin ===", nRec);
+}
+
+// COMPLETE SCENE DUMP — serialize LITERALLY EVERYTHING reachable in the render scene graph to a binary
+// sidecar (scene.bin): every node (pre-order) with its type/name/flags/local+world transform/bound, and for
+// every geometry the STAGED GPU vertex+index buffers, vertexDesc, dynamicData, shader/alpha properties, and
+// the FULL skin state (bone palette, per-bone world transforms, NiSkinData inverse-binds, and every partition
+// with bones/vertexMap/triList/p.weights/p.bonePalette + per-vertex embedded weights/slots/pos). Roots: all
+// four shadowSceneNode[] + player 3D + every loaded-cell reference's 3D. Deduped by address, depth-capped.
+// This is the "there is finite data, dump ALL of it" pass — one capture reconstructs the entire scene offline.
+void VsmDiagnostics::DumpSceneFull()
+{
+	using namespace DirectX;
+	using V = RE::BSGraphics::Vertex;
+	auto& device  = m_core.device;
+	auto& context = m_core.context;
+	auto dir = logger::log_directory();
+	if (!dir || !device || !context)
+		return;
+	std::ofstream sf(*dir / "VirtualShadowMaps_scene.bin", std::ios::binary | std::ios::trunc);
+	if (!sf) {
+		logger::warn("VSM scene dump: cannot open scene.bin");
+		return;
+	}
+
+	ComPtr<ID3D11Buffer> stg;
+	UINT stgSz = 0;
+	std::vector<std::uint8_t> raw;
+	std::unordered_set<const void*> visited;
+	std::uint64_t nNodes = 0, nGeom = 0, nBytes = 0;
+
+	auto wr   = [&](const void* p, size_t n) { sf.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); nBytes += n; };
+	auto wu64 = [&](std::uint64_t v) { wr(&v, 8); };
+	auto wu32 = [&](std::uint32_t v) { wr(&v, 4); };
+	auto wu16 = [&](std::uint16_t v) { wr(&v, 2); };
+	auto wu8  = [&](std::uint8_t v) { wr(&v, 1); };
+	auto wf   = [&](float v) { wr(&v, 4); };
+	auto wstr = [&](const char* s) { const std::uint16_t n = s ? static_cast<std::uint16_t>(strnlen(s, 4096)) : 0; wu16(n); if (n) wr(s, n); };
+	auto wxform = [&](const RE::NiTransform& t) {
+		const auto& e = t.rotate.entry;
+		float f[13] = { e[0][0], e[0][1], e[0][2], e[1][0], e[1][1], e[1][2], e[2][0], e[2][1], e[2][2],
+			t.translate.x, t.translate.y, t.translate.z, t.scale };
+		wr(f, sizeof(f));
+	};
+	// Stage a GPU buffer into `raw`; returns byte count (0 on failure/none).
+	auto stage = [&](RE::ID3D11Buffer* rebuf) -> UINT {
+		if (!rebuf)
+			return 0;
+		auto* buf = reinterpret_cast<ID3D11Buffer*>(rebuf);
+		D3D11_BUFFER_DESC bd{};
+		buf->GetDesc(&bd);
+		const UINT n = bd.ByteWidth;
+		if (!n)
+			return 0;
+		if (!stg || stgSz < n) {
+			stg.Reset();
+			D3D11_BUFFER_DESC sd{};
+			sd.ByteWidth = n;
+			sd.Usage = D3D11_USAGE_STAGING;
+			sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			if (FAILED(device->CreateBuffer(&sd, nullptr, &stg))) { stgSz = 0; return 0; }
+			stgSz = n;
+		}
+		D3D11_BOX b{ 0, 0, 0, n, 1, 1 };
+		context->CopySubresourceRegion(stg.Get(), 0, 0, 0, 0, buf, 0, &b);
+		D3D11_MAPPED_SUBRESOURCE m{};
+		if (FAILED(context->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &m)))
+			return 0;
+		raw.assign(static_cast<const std::uint8_t*>(m.pData), static_cast<const std::uint8_t*>(m.pData) + n);
+		context->Unmap(stg.Get(), 0);
+		return n;
+	};
+
+	std::function<void(RE::NiAVObject*, std::uint32_t)> ser = [&](RE::NiAVObject* o, std::uint32_t depth) {
+		if (!o || depth > 128)
+			return;
+		if (!visited.insert(o).second)
+			return;
+		++nNodes;
+		// --- generic node header ---
+		wu32(0x444F4E53);  // 'SNOD'
+		wu64(reinterpret_cast<std::uint64_t>(o));
+		wu32(depth);
+		wu32(o->GetFlags().underlying());
+		wstr(o->GetRTTI() ? o->GetRTTI()->name : "?");
+		wstr(o->name.c_str());
+		wxform(o->local);
+		wxform(o->world);
+		wf(o->worldBound.center.x); wf(o->worldBound.center.y); wf(o->worldBound.center.z); wf(o->worldBound.radius);
+
+		auto* geom = netimmerse_cast<RE::BSGeometry*>(o);
+		auto* node = o->AsNode();
+		wu8(geom ? 2 : (node ? 1 : 0));
+		wu8(geom ? 1 : 0);
+		if (geom) {
+			++nGeom;
+			auto& grd = geom->GetGeometryRuntimeData();
+			auto* rd  = grd.rendererData;
+			auto& vd  = grd.vertexDesc;
+			wu32(vd.GetSize());
+			wu32(static_cast<std::uint32_t>(vd.GetFlags()));
+			wu32(vd.GetAttributeOffset(V::VA_POSITION));
+			wu32(vd.GetAttributeOffset(V::VA_SKINNING));
+			wu32(vd.HasFlag(V::VF_FULLPREC) ? 1u : 0u);
+			// staged GPU vertex + index buffers
+			const UINT vbN = rd ? stage(rd->vertexBuffer) : 0;
+			wu32(vbN); if (vbN) wr(raw.data(), vbN);
+			const UINT ibN = rd ? stage(rd->indexBuffer) : 0;
+			wu32(ibN); if (ibN) wr(raw.data(), ibN);
+			const std::uint32_t triCount = geom->AsTriShape() ? geom->AsTriShape()->GetTrishapeRuntimeData().triangleCount : 0u;
+			wu32(triCount);
+			// dynamicData (morphed model-space positions)
+			auto* dts = geom->AsDynamicTriShape();
+			const std::uint8_t* dyn = dts ? reinterpret_cast<const std::uint8_t*>(dts->GetDynamicTrishapeRuntimeData().dynamicData) : nullptr;
+			const std::uint32_t dynSize = dts ? dts->GetDynamicTrishapeRuntimeData().dataSize : 0u;
+			const std::uint32_t dynVerts = (dyn && dynSize >= 16) ? dynSize / 16u : 0u;
+			wu8(dts ? 1 : 0);
+			wu32(dynVerts);
+			if (dyn) wr(dyn, static_cast<size_t>(dynVerts) * 16u);
+			// properties (shader + alpha)
+			auto* sp = grd.shaderProperty.get();
+			wu8(sp ? 1 : 0);
+			wu64(sp ? sp->flags.underlying() : 0ull);
+			wu8(sp && netimmerse_cast<RE::BSEffectShaderProperty*>(sp) ? 1 : 0);
+			wu8(sp && netimmerse_cast<RE::BSLightingShaderProperty*>(sp) ? 1 : 0);
+			auto* ap = grd.alphaProperty.get();
+			wu8(ap ? 1 : 0);
+			wu8(ap && ap->GetAlphaBlending() ? 1 : 0);
+			wu8(ap && ap->GetAlphaTesting() ? 1 : 0);
+			wu8(ap ? ap->alphaThreshold : 0);
+			// FULL skin state
+			auto* skin = grd.skinInstance.get();
+			wu8(skin && skin->skinPartition && skin->boneMatrices && skin->numMatrices ? 1 : 0);
+			if (skin && skin->skinPartition && skin->boneMatrices && skin->numMatrices) {
+				const std::uint32_t numMats = skin->numMatrices;
+				const std::uint32_t matFloats = (skin->allocatedSize / numMats) / static_cast<std::uint32_t>(sizeof(float));
+				wu32(numMats); wu32(matFloats);
+				wr(skin->boneMatrices, static_cast<size_t>(numMats) * matFloats * sizeof(float));  // GPU palette
+				// per-bone WORLD transforms (the actual pose)
+				wu8(skin->boneWorldTransforms ? 1 : 0);
+				if (skin->boneWorldTransforms)
+					for (std::uint32_t b = 0; b < numMats; ++b) {
+						const RE::NiTransform* bt = skin->boneWorldTransforms[b];
+						wu8(bt ? 1 : 0);
+						if (bt) wxform(*bt);
+					}
+				// NiSkinData inverse-binds (skinToBone) + bounds
+				auto* sd = skin->skinData.get();
+				wu8(sd ? 1 : 0);
+				if (sd) {
+					wu32(sd->bones);
+					wxform(sd->rootParentToSkin);
+					if (sd->boneData)
+						for (std::uint32_t b = 0; b < sd->bones; ++b) {
+							wxform(sd->boneData[b].skinToBone);
+							wf(sd->boneData[b].bound.center.x); wf(sd->boneData[b].bound.center.y);
+							wf(sd->boneData[b].bound.center.z); wf(sd->boneData[b].bound.radius);
+						}
+				}
+				// partitions — every array
+				auto* spt = skin->skinPartition.get();
+				wu32(spt->numPartitions);
+				for (std::uint32_t pi = 0; pi < spt->numPartitions; ++pi) {
+					auto& p = spt->partitions[pi];
+					auto& pvd = p.vertexDesc;
+					const std::uint32_t pstride = pvd.GetSize();
+					const std::uint32_t pskin = pvd.GetAttributeOffset(V::VA_SKINNING);
+					const std::uint32_t ppos  = pvd.GetAttributeOffset(V::VA_POSITION);
+					wu16(p.vertices); wu16(p.triangles); wu16(p.numBones); wu16(p.strips); wu16(p.bonesPerVertex);
+					wu32(pstride); wu32(pskin); wu32(ppos); wu32(static_cast<std::uint32_t>(pvd.GetFlags()));
+					for (std::uint16_t b = 0; b < p.numBones; ++b) wu16(p.bones ? p.bones[b] : 0xFFFFu);
+					for (std::uint16_t lv = 0; lv < p.vertices; ++lv) wu16(p.vertexMap ? p.vertexMap[lv] : 0xFFFFu);
+					for (std::uint32_t k = 0; k < static_cast<std::uint32_t>(p.triangles) * 3u; ++k) wu16(p.triList ? p.triList[k] : 0u);
+					const std::uint32_t bpv = p.bonesPerVertex;
+					// canonical partition weights (float) + bone palette (byte), vertices*bonesPerVertex each
+					wu8(p.weights ? 1 : 0);
+					if (p.weights) wr(p.weights, static_cast<size_t>(p.vertices) * bpv * sizeof(float));
+					wu8(p.bonePalette ? 1 : 0);
+					if (p.bonePalette) wr(p.bonePalette, static_cast<size_t>(p.vertices) * bpv);
+					// per-vertex embedded skinning (from the partition vertex buffer) + position
+					const std::uint8_t* rv = p.buffData ? reinterpret_cast<const std::uint8_t*>(p.buffData->rawVertexData) : nullptr;
+					wu8(rv ? 1 : 0);
+					if (rv)
+						for (std::uint16_t lv = 0; lv < p.vertices; ++lv) {
+							std::uint16_t wh[4]{}; std::uint8_t slot[4]{}; float bp[3]{};
+							const std::uint8_t* vb = rv + static_cast<size_t>(lv) * pstride;
+							if (pskin + 12 <= pstride) { std::memcpy(wh, vb + pskin, 8); std::memcpy(slot, vb + pskin + 8, 4); }
+							if (ppos + 12 <= pstride) std::memcpy(bp, vb + ppos, 12);
+							wr(wh, 8); wr(slot, 4); wr(bp, 12);
+						}
+				}
+			}
+		}
+		// --- children (pre-order) ---
+		if (node) {
+			auto& ch = node->GetChildren();
+			wu32(static_cast<std::uint32_t>(ch.size()));
+			for (auto& c : ch)
+				ser(c.get(), depth + 1);
+		} else {
+			wu32(0);
+		}
+	};
+
+	auto& sm = RE::BSShaderManager::State::GetSingleton();
+	for (int i = 0; i < 4; ++i)
+		if (sm.shadowSceneNode[i])
+			ser(reinterpret_cast<RE::NiAVObject*>(sm.shadowSceneNode[i]), 0);
+	if (auto* pc = RE::PlayerCharacter::GetSingleton()) {
+		if (auto* p3 = pc->Get3D())
+			ser(p3, 0);
+		if (auto* cell = pc->GetParentCell())
+			cell->ForEachReference([&](RE::TESObjectREFR* r) {
+				if (r)
+					if (auto* r3 = r->Get3D())
+						ser(r3, 0);
+				return RE::BSContainer::ForEachResult::kContinue;
+			});
+	}
+	logger::info("=== FULL SCENE DUMP -> VirtualShadowMaps_scene.bin: nodes={} geometries={} bytes={} ({:.1f} MB) ===",
+	    nNodes, nGeom, nBytes, static_cast<double>(nBytes) / (1024.0 * 1024.0));
+}
+
 // Full identity + relationship of a TESObjectREFR: base object (formID/editorID/type), the mesh/NIF path,
 // its linked ref + enable-state parent (how a SEPARATE ref links to the light), and its parent cell. This is
 // the complete object record so the log alone answers "what is this object, and is it the light's own housing".
@@ -865,6 +1213,10 @@ void VsmDiagnostics::DumpDiagnosticLog()
 	auto& rejectedHidden         = m_core.rejectedHidden;
 	auto& rejectedTransparent    = m_core.rejectedTransparent;
 	auto& rejectedBillboard      = m_core.rejectedBillboard;
+	auto& rejectedUserNoCast     = m_core.rejectedUserNoCast;
+	auto& userForcedCast         = m_core.userForcedCast;
+	auto& rejectedNotVisible     = m_core.rejectedNotVisible;
+	auto& rejectedEngineFlag     = m_core.rejectedEngineFlag;
 	auto& depthTex               = m_core.depthTex;
 	auto& idTex                  = m_core.idTex;
 	auto& lightDynamic           = m_core.lightDynamic;
@@ -1052,6 +1404,10 @@ void VsmDiagnostics::DumpDiagnosticLog()
 	    rejectedHidden, rejectedTransparent);
 	logger::info("skipped as BILLBOARD (under NiBillboardNode: camera-facing smoke/vapor/fire/glow planes)={}  (their hard shadow would ride the camera + they are translucent effects; the moving 'Plane03' vapor-smoke bar)",
 	    rejectedBillboard);
+	logger::info("config [classification] pattern override: forceNoCast-rejected={} forceCast-forced={}  (0/0 unless the user set forceCast/forceNoCast in the .toml; forceCast beats every built-in exclusion)",
+	    rejectedUserNoCast, userForcedCast);
+	logger::info("skipped as ENGINE-doesn't-cast (research flags): notVisible(NiAVObject kNotVisible)={} engineFlag(nonProjective|billboard|wireframe|LOD|water)={}  (mirror what vanilla omits from the shadow pass; notVisible = prime suspect for invisible-mesh-casting-on-characters)",
+	    rejectedNotVisible, rejectedEngineFlag);
 
 	// ---- Skinned-geometry probe (Path B): what buffers/data are ACTUALLY available at Present time for
 	// the skinned casters, so we build the compute-skinning path from real data, not assumptions. ----
@@ -1672,4 +2028,6 @@ void VsmDiagnostics::DumpDiagnosticLog()
 	// Log EVERYTHING for offline ground-truth: real world-space triangles of every caster (exact silhouettes,
 	// no box over-occlusion), then the actual shadow map from the real shader.
 	DumpGeometry();
+	DumpSkinningFull();  // COMPLETE skinning state (palette + dynamicData + per-partition bones/maps/weights/slots) -> skin.bin
+	DumpSceneFull();     // EVERYTHING in the scene graph (all nodes + all geometry buffers/props/skin) -> scene.bin
 }
