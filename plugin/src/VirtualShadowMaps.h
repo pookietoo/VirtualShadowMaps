@@ -164,6 +164,7 @@ private:
 	float rtShadowDistance = 8000.0f; // fShadowDistance -> camera-distance shadow reach (feeds the parked fade/cull, #10)
 	void ComputeAtlasDims();        // read iShadowMapResolution -> ladder bounds (max/floor) + block dims (once, before setup)
 	bool CreateAtlasResources();    // (re)create depth+id atlas textures/views at rtAtlasW x rtAtlasH
+	void EnsureTransmittanceAtlas();  // O9: lazily create the A5 RGBA transmittance atlas (only when translucentShadows on)
 	// Per-frame variable-resolution: pick each light's cube-face rung on the pow2 ladder from the on-screen
 	// size metric (radius/dist), with hysteresis; then pack the per-light 3x2 blocks into the atlas + size it.
 	int  AssignFaceRes(float a_radius, const RE::NiPoint3& a_lightPos, const RE::NiPoint3& a_camPos, const void* a_lightId);

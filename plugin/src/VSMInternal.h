@@ -16,6 +16,11 @@ namespace vsm::internal
 	// plugin DLL is actually running. Bump the description each build. (The SKSE plugin version
 	// number is separate — see Plugin.h / CMake project VERSION.)
 	inline constexpr char kBuildTag[] =
+	    "0.9.94 PERF modules (both code-complete, compile clean, UNTESTED in-game): O4 cullEmptyLightPasses (config "
+	    "toggle, default OFF) — skip a light's whole 6-face caster pass when no caster lies within its radius; "
+	    "O9 lazy transmittance atlas — allocate the A5 RGBA atlas only when translucentShadows is on "
+	    "(EnsureTransmittanceAtlas creates it on-demand incl. the runtime A5 toggle so t112 is never unbound; freed on "
+	    "A5-off), saving ~1 atlas of VRAM in the default case. No behaviour change with the toggles off. Prior "
 	    "0.9.93 FIX skinned-head explosion, ROOT CAUSE FOUND + validated (supersedes the 0.9.91/0.9.92 index theories). "
 	    "TWO real bugs, both now fixed: (1) SPACE MISMATCH — for a BSDynamicTriShape, dynamicData AND every skin partition's "
 	    "buffData are ONE shared, shape-GLOBAL vertex buffer (dataSize/16 == sp->vertexCount == UNIQUE count; partitions SHARE "

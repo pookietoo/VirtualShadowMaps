@@ -26,6 +26,8 @@ namespace vsm
 		                                   // budgeted re-bakes (only the dirty light's block re-renders), instead of P2's whole-cache rebuild
 		bool  translucentShadows = false;  // A5 module (default OFF): colored translucent shadows — glass/alpha casters dim + tint the
 		                                   // light passing through (transmittance atlas at t112), instead of being excluded entirely
+		bool  cullEmptyLightPasses = false;  // O4 perf (default OFF): skip a light's entire 6-face caster pass when NO caster (static,
+		                                     // dynamic, or skinned) lies within its radius — CPU sphere-vs-radius pre-check. UNTESTED.
 
 		// [classification] — per-shape shadow-caster overrides matched against the caster's model NIF path
 		// (substring, e.g. '\effects\') and shape name (WHOLE-TOKEN, so 'marker' hits 'EditorMarker' but not

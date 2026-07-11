@@ -349,18 +349,11 @@ bool VirtualShadowMaps::CreateAtlasResources()
 	}
 	// A5: colored transmittance atlas (RGBA8), SAME size/layout as the depth atlas. Glass/alpha casters render here
 	// under a multiplicative blend; LLF samples it at t112. Cleared white each frame, so it's a no-op when A5 is off.
+	// O9 (lazy): allocated ONLY when translucentShadows is on — the default (A5 off) case skips a full W*H*4 atlas.
+	// (transTex is only ever USED when A5 is on; the shader gates the t112 sample on gTranslucentOn.)
 	transTex.Reset(); transRTV.Reset(); transSRV.Reset();
-	{
-		D3D11_TEXTURE2D_DESC tt = td;
-		tt.Format    = DXGI_FORMAT_R8G8B8A8_UNORM;
-		tt.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-		if (SUCCEEDED(device->CreateTexture2D(&tt, nullptr, &transTex))) {
-			device->CreateRenderTargetView(transTex.Get(), nullptr, &transRTV);
-			device->CreateShaderResourceView(transTex.Get(), nullptr, &transSRV);
-		} else {
-			logger::warn("VSM: transmittance atlas creation failed ({}x{}); A5 colored shadows unavailable", rtAtlasW, rtAtlasH);
-		}
-	}
+	if (vsm::GetConfig().translucentShadows)
+		EnsureTransmittanceAtlas();
 	// A5: read-only DSV of the opaque depth atlas — the glass pass depth-tests (GREATER) against it WITHOUT writing,
 	// so glass occluded by opaque geometry doesn't tint, while overlapping glass panes all still contribute.
 	dsvReadOnly.Reset();
@@ -376,6 +369,30 @@ bool VirtualShadowMaps::CreateAtlasResources()
 		CreateStaticCacheResources();
 	staticCacheValid = false;   // the live atlas was (re)created -> any cached static depth is gone; re-bake
 	return true;
+}
+
+// O9 (lazy transmittance): create the A5 RGBA8 transmittance atlas at the current atlas size, only if it doesn't
+// already exist. Called from CreateAtlasResources when translucentShadows is on, and on-demand when A5 is toggled
+// on at runtime (so the shader never samples an unbound t112 — the 0.9.87 black-lights regression). Idempotent.
+void VirtualShadowMaps::EnsureTransmittanceAtlas()
+{
+	if (transTex || !device || rtAtlasW <= 0 || rtAtlasH <= 0)
+		return;
+	D3D11_TEXTURE2D_DESC tt{};
+	tt.Width              = static_cast<UINT>(rtAtlasW);
+	tt.Height             = static_cast<UINT>(rtAtlasH);
+	tt.MipLevels          = 1;
+	tt.ArraySize          = 1;
+	tt.Format             = DXGI_FORMAT_R8G8B8A8_UNORM;
+	tt.SampleDesc.Count   = 1;
+	tt.Usage              = D3D11_USAGE_DEFAULT;
+	tt.BindFlags          = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	if (SUCCEEDED(device->CreateTexture2D(&tt, nullptr, &transTex))) {
+		device->CreateRenderTargetView(transTex.Get(), nullptr, &transRTV);
+		device->CreateShaderResourceView(transTex.Get(), nullptr, &transSRV);
+	} else {
+		logger::warn("VSM: transmittance atlas creation failed ({}x{}); A5 colored shadows unavailable", rtAtlasW, rtAtlasH);
+	}
 }
 
 // (Re)create the P2 static-cache depth texture + DSV at the current atlas size. Same D32_TYPELESS desc as the
@@ -2087,7 +2104,33 @@ void VirtualShadowMaps::DrawSkinnedRange(const SkinnedRange& r, DirectX::FXMMATR
 void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 {
 	const bool blinkOff = (flashCaster >= 0) && (((frameIndex / kFlashHalfPeriodFrames) % 2u) == 1u);
+	// O4 (config.cullEmptyLightPasses, default OFF): skip a light's whole 6-face pass when NO caster this pass
+	// would draw lies within the light's radius — a CPU sphere-vs-radius pre-check over exactly what the pass
+	// draws (opaque buffer casters matching the filter via casterWorldSphere; skinned ranges when a_drawSkinned).
+	// Conservative: culls only when provably empty; the default-off toggle keeps the baseline untouched.
+	const bool cullEmpty = vsm::GetConfig().cullEmptyLightPasses;
 	for (const auto& light : lightRecords) {
+		if (cullEmpty) {
+			const float lx = light.positionWS.x, ly = light.positionWS.y, lz = light.positionWS.z;
+			const float lr = light.farPlane;  // far plane == light radius
+			bool any = false;
+			for (size_t i = 0; i < registry.size() && !any; ++i) {
+				if (registry[i].isTranslucent) continue;                 // glass never draws in the opaque passes
+				if (a_filter == 1 && !registry[i].isStatic) continue;
+				if (a_filter == 2 && registry[i].isStatic) continue;
+				const auto& s = casterWorldSphere[i];
+				if (s.w < 0.0f) continue;                                // no sphere (skinned/engineOnly) -> checked below
+				const float dx = s.x - lx, dy = s.y - ly, dz = s.z - lz;
+				if (std::sqrt(dx * dx + dy * dy + dz * dz) - s.w <= lr) any = true;
+			}
+			if (!any && a_drawSkinned)
+				for (const auto& r : skinnedRanges) {
+					const float dx = r.center.x - lx, dy = r.center.y - ly, dz = r.center.z - lz;
+					if (std::sqrt(dx * dx + dy * dy + dz * dz) - r.radius <= lr) { any = true; break; }
+				}
+			if (!any)
+				continue;  // no caster reaches this light -> skip all 6 faces (no viewport/matrix/clear/draw)
+		}
 		ForEachLightFace(light, [&](const XMMATRIX& faceVP, const XMFLOAT4* planes) {
 			for (size_t i = 0; i < registry.size(); ++i) {
 				if (a_filter == 1 && !registry[i].isStatic) continue;   // static-only pass
@@ -2422,6 +2465,13 @@ void VirtualShadowMaps::DrawMenu()
 	if (ImGui::Checkbox("Translucent shadows (A5)##VSM", &vsm::GetConfig().translucentShadows)) {
 		settingsDirty = true;
 		registryDirty = true;  // capture (or drop) glass/alpha casters on the next registry rebuild
+		// O9 (lazy transmittance): the atlas is allocated on demand. Toggling A5 ON must create it now, or the
+		// shader would sample an unbound t112 this frame (the 0.9.87 black-lights regression); OFF frees the VRAM.
+		if (vsm::GetConfig().translucentShadows)
+			EnsureTransmittanceAtlas();
+		else {
+			transTex.Reset(); transRTV.Reset(); transSRV.Reset();
+		}
 	}
 	ImGui::SameLine(); ImGui::TextDisabled("glass/alpha casters dim + tint the light");
 
