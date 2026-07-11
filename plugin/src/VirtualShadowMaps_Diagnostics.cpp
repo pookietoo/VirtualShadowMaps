@@ -18,11 +18,14 @@
 #include "VSMInternal.h"
 
 #include <DirectXPackedVector.h>
+#include <d3dcompiler.h>
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <unordered_map>
+#include <vector>
 #include <unordered_set>
 #include <cfloat>
 #include <cmath>
@@ -499,7 +502,9 @@ void VsmDiagnostics::DumpSkinnedGeometry()
 						const float cx = wc.x - sceneCameraPos.x, cy = wc.y - sceneCameraPos.y, cz = wc.z - sceneCameraPos.z;
 						const float ecr = std::sqrt((bx - cx) * (bx - cx) + (by - cy) * (by - cy) + (bz - cz) * (bz - cz));
 						const float em  = std::sqrt(bx * bx + by * by + bz * bz);
-						const char* cls = (ew < kSkinSpaceTolerance) ? "WORLD" : (ecr < kSkinSpaceTolerance) ? "CAMERA-REL(BUG)" : (em < kSkinSpaceTolerance) ? "MODEL(BUG)" : "OTHER(BUG)";
+						// NOT a bug verdict — bone0 is not the mesh centre (top-hung cloth / displaced NPC read OTHER
+						// even when posed correctly). The authoritative our-vs-engine check is the cmp[] block below.
+						const char* cls = (ew < kSkinSpaceTolerance) ? "WORLD" : (ecr < kSkinSpaceTolerance) ? "CAMERA-REL?" : (em < kSkinSpaceTolerance) ? "MODEL?" : "OTHER(bone0-heuristic; see cmp[])";
 						if (ew < kSkinSpaceTolerance)       ++spaceWorld;
 						else if (ecr < kSkinSpaceTolerance) ++spaceCamRel;
 						else if (em < kSkinSpaceTolerance)  ++spaceModel;
@@ -718,7 +723,8 @@ void VsmDiagnostics::DumpSkinningFull()
 	             "char[64] name, f32[16] worldMat, f32[4] boundC+r, u32 numMats,u32 matFloats, f32[numMats*matFloats] palette, "
 	             "u32 dynVerts, f32[dynVerts*3] dynamicData, u32 numParts, [u16 verts,tris,numBones,strips; u32 stride,skinOff,posOff,"
 	             "vdFlags,fullprec; u16[numBones] bones; u16[verts] vertexMap; u16[tris*3] triList; per-vert(u16[4] wHalf,u8[4] slot,"
-	             "f32[3] bufPos)]xnumParts) ===");
+	             "f32[3] bufPos)]xnumParts, THEN u32 Nfull, per-g(u16[4] wHalf,u8[4] slot,f32[3] bufPos)xNfull = the FULL shared "
+	             "global buffer at global vertex ids [0,sp->vertexCount) for Rule-B seam-tail validation) ===");
 
 	std::uint32_t nRec = 0;
 	for (std::uint32_t ri = 0; ri < registry.size(); ++ri) {
@@ -791,6 +797,30 @@ void VsmDiagnostics::DumpSkinningFull()
 					wr(wh, sizeof(wh)); wr(slot, sizeof(slot)); wr(bp, sizeof(bp));
 				}
 			}
+			// --- FULL shared global buffer [0, sp->vertexCount) (Rule-B seam-tail validation) ---
+			// All partitions share ONE buffer of sp->vertexCount unique verts, indexed by GLOBAL vertex id;
+			// the per-partition capture above only reaches [0, largestPartitionVerts), so the high-index seam
+			// tail was never dumped (the residual "validated by inference" gap). Dump the WHOLE buffer at global
+			// indices so the offline recon can validate the ENTIRE mesh (weights/slots/pos at every global id).
+			{
+				auto& gp = sp->partitions[0];
+				auto& gvd = gp.vertexDesc;
+				const std::uint32_t gStride  = gvd.GetSize();
+				const std::uint32_t gSkinOff = gvd.GetAttributeOffset(V::VA_SKINNING);
+				const std::uint32_t gPosOff  = gvd.GetAttributeOffset(V::VA_POSITION);
+				const std::uint8_t* grv = gp.buffData ? reinterpret_cast<const std::uint8_t*>(gp.buffData->rawVertexData) : nullptr;
+				const std::uint32_t Nfull = sp->vertexCount;
+				wu32(Nfull);
+				for (std::uint32_t gv = 0; gv < Nfull; ++gv) {
+					std::uint16_t wh[4]{}; std::uint8_t slot[4]{}; float bp[3]{};
+					if (grv && gStride) {
+						const std::uint8_t* vb = grv + static_cast<size_t>(gv) * gStride;
+						if (gSkinOff + 12 <= gStride) { std::memcpy(wh, vb + gSkinOff, 8); std::memcpy(slot, vb + gSkinOff + 8, 4); }
+						if (gPosOff + 12 <= gStride) std::memcpy(bp, vb + gPosOff, 12);
+					}
+					wr(wh, sizeof(wh)); wr(slot, sizeof(slot)); wr(bp, sizeof(bp));
+				}
+			}
 			// --- readable summary + the layout sanity check ---
 			logger::info("  skinFULL[{}] '{}' dyn={} parts={} dynVerts={} sumPartVerts={} spVertexCount={} {} numMats={} matFloats={}",
 			    ri, nm, isDyn ? 1 : 0, sp->numPartitions, dynVerts, sumVerts, sp->vertexCount,
@@ -808,6 +838,258 @@ void VsmDiagnostics::DumpSkinningFull()
 		}
 	}
 	logger::info("=== FULL SKINNING DUMP: wrote {} skinned casters to skin.bin ===", nRec);
+
+	// === OUR-vs-ENGINE skin agreement (Rule-B oracle) ===
+	// Compare OUR posed centroid+radius (skinnedRanges — self-consistent with the verts we actually rasterize)
+	// to the engine's own BSGeometry::worldBound, the one INDEPENDENT engine opinion we can read (the engine
+	// recomputes it from the skinned mesh). RADIUS is the reliable size oracle; the bound CENTER can lag a frame
+	// for a moving skeleton, so a large centre delta with a MATCHING radius = stale bound, NOT a skinning error.
+	logger::info("=== OUR-vs-ENGINE skin agreement (posed vs BSGeometry::worldBound; radius=size oracle, centre can be stale) ===");
+	int cmpN = 0, cmpRadBad = 0;
+	for (const auto& r : m_core.skinnedRanges) {
+		if (r.registryIndex < 0 || static_cast<size_t>(r.registryIndex) >= registry.size())
+			continue;
+		RE::BSGeometry* cg = registry[r.registryIndex].geom.get();
+		if (!cg)
+			continue;
+		const auto& wb = cg->worldBound;
+		const float dx = r.center.x - wb.center.x, dy = r.center.y - wb.center.y, dz = r.center.z - wb.center.z;
+		const float cDelta = std::sqrt(dx * dx + dy * dy + dz * dz);
+		const float rRatio = wb.radius > 0.01f ? r.radius / wb.radius : 0.0f;
+		const bool  radBad = (rRatio > 1.5f || rRatio < 0.5f);
+		if (radBad)
+			++cmpRadBad;
+		++cmpN;
+		logger::info("  cmp[{}] '{}' ourC=({:.1f} {:.1f} {:.1f}) ourR={:.1f} | engC=({:.1f} {:.1f} {:.1f}) engR={:.1f} | centreDelta={:.1f} radiusRatio={:.2f} {}",
+		    r.registryIndex, cg->name.c_str() ? cg->name.c_str() : "", r.center.x, r.center.y, r.center.z, r.radius,
+		    wb.center.x, wb.center.y, wb.center.z, wb.radius, cDelta, rRatio,
+		    radBad ? "[RADIUS MISMATCH -> possible skinning error]" : (cDelta > wb.radius ? "[centre off, radius ok -> likely stale bound, not an error]" : "ok"));
+	}
+	logger::info("=== OUR-vs-ENGINE: {} rendered skinned casters compared, {} with radius mismatch (flagged) ===", cmpN, cmpRadBad);
+}
+
+// GPU-READBACK SKIN ORACLE (dump #3). The engine skins on the GPU at draw time and keeps NO CPU array of final
+// skinned world verts, so there is no "engine skinned mesh" to query directly. This reproduces the engine's own
+// linear-blend skinning ON THE GPU using the engine's EXACT boneMatrices palette + bind verts + weights + slots
+// (all engine inputs, same LBS the engine's vertex shader runs), reads the result back to CPU, and writes it to
+// gpuskin.bin. Compared offline to our CPU (Rule-B) skin + geom.bin, it confirms our CPU LBS matches a GPU LBS to
+// float precision (catches any CPU/GPU math or layout drift). Per record LE: char[4] MAGIC='GSKN', u32 regIdx,
+// char[64] name, u32 N, f32[N*3] skinnedWorldPos. Runs only on an explicit dump (heavy, one-shot).
+void VsmDiagnostics::DumpGpuSkinReadback()
+{
+	using namespace DirectX;
+	using namespace DirectX::PackedVector;
+	using V = RE::BSGraphics::Vertex;
+	using Microsoft::WRL::ComPtr;
+	auto& registry = m_core.registry;
+	auto& device   = m_core.device;
+	auto& context  = m_core.context;
+	if (registry.empty() || !device || !context)
+		return;
+	auto dir = logger::log_directory();
+	if (!dir)
+		return;
+
+	// Compile the LBS compute shader once (cached). Row-major 3x4 palette; matches VSM_SkinCaster's math exactly.
+	static ComPtr<ID3D11ComputeShader> cs;
+	if (!cs) {
+		static const char* kSkinCS =
+		    "StructuredBuffer<float4> gPos : register(t0);\n"
+		    "StructuredBuffer<float4> gWt  : register(t1);\n"
+		    "StructuredBuffer<uint4>  gIdx : register(t2);\n"
+		    "StructuredBuffer<float4> gPal : register(t3);\n"   // 3 rows per bone (row-major 3x4 skin->world)
+		    "RWStructuredBuffer<float4> gOut : register(u0);\n"
+		    "cbuffer CB : register(b0) { uint gN; uint gNumMats; uint2 _pad; };\n"
+		    "[numthreads(64,1,1)]\n"
+		    "void main(uint3 dt : SV_DispatchThreadID) {\n"
+		    "  uint g = dt.x; if (g >= gN) return;\n"
+		    "  float4 p = float4(gPos[g].xyz, 1.0);\n"
+		    "  float4 w = gWt[g]; uint4 ix = gIdx[g];\n"
+		    "  float3 acc = float3(0,0,0);\n"
+		    "  [unroll] for (int b=0;b<4;++b){ float wt=w[b]; if(wt<=0.0) continue; uint gi=ix[b]; if(gi>=gNumMats) continue;\n"
+		    "    acc.x += wt*dot(gPal[gi*3+0], p); acc.y += wt*dot(gPal[gi*3+1], p); acc.z += wt*dot(gPal[gi*3+2], p); }\n"
+		    "  gOut[g] = float4(acc, 1.0);\n"
+		    "}\n";
+		ComPtr<ID3DBlob> blob, err;
+		if (FAILED(D3DCompile(kSkinCS, std::strlen(kSkinCS), "SkinReadbackCS", nullptr, nullptr, "main", "cs_5_0", 0, 0, &blob, &err))) {
+			logger::warn("VSM gpuskin: compute shader compile failed");
+			return;
+		}
+		if (FAILED(device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &cs))) {
+			logger::warn("VSM gpuskin: CreateComputeShader failed");
+			return;
+		}
+	}
+
+	std::ofstream gf(*dir / "VirtualShadowMaps_gpuskin.bin", std::ios::binary | std::ios::trunc);
+	if (!gf) {
+		logger::warn("VSM gpuskin: cannot open gpuskin.bin");
+		return;
+	}
+	auto wr = [&gf](const void* p, size_t n) { gf.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); };
+
+	// Make an IMMUTABLE structured buffer + SRV from CPU data.
+	auto makeSB = [&](const void* data, UINT count, UINT strideBytes, ComPtr<ID3D11Buffer>& buf, ComPtr<ID3D11ShaderResourceView>& srv) -> bool {
+		if (count == 0)
+			return false;
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = count * strideBytes;
+		bd.Usage = D3D11_USAGE_IMMUTABLE;
+		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = strideBytes;
+		D3D11_SUBRESOURCE_DATA sd{ data, 0, 0 };
+		if (FAILED(device->CreateBuffer(&bd, &sd, &buf)))
+			return false;
+		D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+		vd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+		vd.Format = DXGI_FORMAT_UNKNOWN;
+		vd.BufferEx.NumElements = count;
+		return SUCCEEDED(device->CreateShaderResourceView(buf.Get(), &vd, &srv));
+	};
+
+	std::uint32_t nRec = 0;
+	for (std::uint32_t ri = 0; ri < registry.size(); ++ri) {
+		RE::BSGeometry* geo = registry[ri].geom.get();
+		if (!geo)
+			continue;
+		auto* skin = geo->GetGeometryRuntimeData().skinInstance.get();
+		if (!skin || !skin->skinPartition || !skin->boneMatrices || skin->numMatrices == 0)
+			continue;
+		auto* sp = skin->skinPartition.get();
+		const std::uint32_t N = sp->vertexCount;
+		if (N == 0 || sp->numPartitions == 0)
+			continue;
+		const std::uint32_t numMats = skin->numMatrices;
+		const int matStrideF = static_cast<int>(skin->allocatedSize / numMats) / static_cast<int>(sizeof(float));
+		if (matStrideF < 12)
+			continue;
+		const float* pal = reinterpret_cast<const float*>(skin->boneMatrices);
+
+		auto& p0 = sp->partitions[0];
+		auto& pvd = p0.vertexDesc;
+		const std::uint32_t stride  = pvd.GetSize();
+		const std::uint32_t posOff  = pvd.GetAttributeOffset(V::VA_POSITION);
+		const std::uint32_t skinOff = pvd.GetAttributeOffset(V::VA_SKINNING);
+		const std::uint8_t* rv = p0.buffData ? reinterpret_cast<const std::uint8_t*>(p0.buffData->rawVertexData) : nullptr;
+		if (!rv || skinOff + 12 > stride)
+			continue;
+
+		// Position source: dynamicData for a BSDynamicTriShape, else the buffer's VA_POSITION.
+		const std::uint8_t* dyn = nullptr;
+		if (auto* dts = geo->AsDynamicTriShape()) {
+			auto& dr = dts->GetDynamicTrishapeRuntimeData();
+			if (dr.dynamicData && dr.dataSize / 16u == N)
+				dyn = reinterpret_cast<const std::uint8_t*>(dr.dynamicData);
+			else
+				continue;  // dynamic but dynamicData unusable
+		} else if (posOff + 12 > stride) {
+			continue;
+		}
+
+		// Gather CPU inputs (all engine data) for the GPU skinner.
+		std::vector<XMFLOAT4> pos(N), wt(N);
+		std::vector<XMUINT4>  idx(N);
+		for (std::uint32_t g = 0; g < N; ++g) {
+			const std::uint8_t* vb = rv + static_cast<size_t>(g) * stride;
+			const std::uint16_t* wh = reinterpret_cast<const std::uint16_t*>(vb + skinOff);
+			const std::uint8_t*  ib = reinterpret_cast<const std::uint8_t*>(vb + skinOff + 8);
+			if (dyn) {
+				const float* lp = reinterpret_cast<const float*>(dyn + static_cast<size_t>(g) * 16u);
+				pos[g] = { lp[0], lp[1], lp[2], 1.0f };
+			} else {
+				const float* bp = reinterpret_cast<const float*>(vb + posOff);
+				pos[g] = { bp[0], bp[1], bp[2], 1.0f };
+			}
+			wt[g]  = { XMConvertHalfToFloat(wh[0]), XMConvertHalfToFloat(wh[1]), XMConvertHalfToFloat(wh[2]), XMConvertHalfToFloat(wh[3]) };
+			idx[g] = { ib[0], ib[1], ib[2], ib[3] };
+		}
+		std::vector<XMFLOAT4> palRows(static_cast<size_t>(numMats) * 3);
+		for (std::uint32_t bmi = 0; bmi < numMats; ++bmi) {
+			const float* M = pal + static_cast<size_t>(bmi) * matStrideF;
+			palRows[static_cast<size_t>(bmi) * 3 + 0] = { M[0], M[1], M[2], M[3] };
+			palRows[static_cast<size_t>(bmi) * 3 + 1] = { M[4], M[5], M[6], M[7] };
+			palRows[static_cast<size_t>(bmi) * 3 + 2] = { M[8], M[9], M[10], M[11] };
+		}
+
+		ComPtr<ID3D11Buffer> posB, wtB, idxB, palB;
+		ComPtr<ID3D11ShaderResourceView> posS, wtS, idxS, palS;
+		if (!makeSB(pos.data(), N, 16, posB, posS) || !makeSB(wt.data(), N, 16, wtB, wtS) ||
+		    !makeSB(idx.data(), N, 16, idxB, idxS) || !makeSB(palRows.data(), numMats * 3, 16, palB, palS))
+			continue;
+
+		// Output UAV + staging.
+		D3D11_BUFFER_DESC od{};
+		od.ByteWidth = N * 16;
+		od.Usage = D3D11_USAGE_DEFAULT;
+		od.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		od.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		od.StructureByteStride = 16;
+		ComPtr<ID3D11Buffer> outB;
+		if (FAILED(device->CreateBuffer(&od, nullptr, &outB)))
+			continue;
+		D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+		ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		ud.Format = DXGI_FORMAT_UNKNOWN;
+		ud.Buffer.NumElements = N;
+		ComPtr<ID3D11UnorderedAccessView> uav;
+		if (FAILED(device->CreateUnorderedAccessView(outB.Get(), &ud, &uav)))
+			continue;
+		D3D11_BUFFER_DESC stgd = od;
+		stgd.Usage = D3D11_USAGE_STAGING;
+		stgd.BindFlags = 0;
+		stgd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		stgd.MiscFlags = 0;
+		stgd.StructureByteStride = 0;
+		ComPtr<ID3D11Buffer> stg;
+		if (FAILED(device->CreateBuffer(&stgd, nullptr, &stg)))
+			continue;
+
+		struct { std::uint32_t N, numMats, p0, p1; } cbData{ N, numMats, 0, 0 };
+		D3D11_BUFFER_DESC cbd{};
+		cbd.ByteWidth = 16;
+		cbd.Usage = D3D11_USAGE_IMMUTABLE;
+		cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		D3D11_SUBRESOURCE_DATA cbsd{ &cbData, 0, 0 };
+		ComPtr<ID3D11Buffer> cb;
+		if (FAILED(device->CreateBuffer(&cbd, &cbsd, &cb)))
+			continue;
+
+		context->CSSetShader(cs.Get(), nullptr, 0);
+		ID3D11ShaderResourceView* srvs[4] = { posS.Get(), wtS.Get(), idxS.Get(), palS.Get() };
+		context->CSSetShaderResources(0, 4, srvs);
+		UINT init = 0;
+		context->CSSetUnorderedAccessViews(0, 1, uav.GetAddressOf(), &init);
+		context->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
+		context->Dispatch((N + 63u) / 64u, 1, 1);
+
+		// Unbind (leave no CS state bound for the engine) + read back.
+		ID3D11UnorderedAccessView* nullUav = nullptr;
+		context->CSSetUnorderedAccessViews(0, 1, &nullUav, &init);
+		ID3D11ShaderResourceView* nullSrv[4] = {};
+		context->CSSetShaderResources(0, 4, nullSrv);
+		context->CSSetShader(nullptr, nullptr, 0);
+		context->CopyResource(stg.Get(), outB.Get());
+		D3D11_MAPPED_SUBRESOURCE mp{};
+		if (FAILED(context->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &mp)))
+			continue;
+		const XMFLOAT4* out = reinterpret_cast<const XMFLOAT4*>(mp.pData);
+		wr("GSKN", 4);
+		wr(&ri, 4);
+		char nm[64]{};
+		std::strncpy(nm, geo->name.c_str() ? geo->name.c_str() : "", sizeof(nm) - 1);
+		wr(nm, sizeof(nm));
+		wr(&N, 4);
+		for (std::uint32_t g = 0; g < N; ++g) {
+			const float xyz[3]{ out[g].x, out[g].y, out[g].z };
+			wr(xyz, sizeof(xyz));
+		}
+		context->Unmap(stg.Get(), 0);
+		++nRec;
+	}
+	logger::info("=== GPU-READBACK SKIN ORACLE -> VirtualShadowMaps_gpuskin.bin: {} casters (per record LE: char[4] 'GSKN', "
+	             "u32 regIdx, char[64] name, u32 N, f32[N*3] skinnedWorldPos). Offline: compare to our CPU skin (skin.bin "
+	             "full buffer + Rule-B) and geom.bin — should match to float precision. ===", nRec);
 }
 
 // COMPLETE SCENE DUMP — serialize LITERALLY EVERYTHING reachable in the render scene graph to a binary
@@ -2028,6 +2310,7 @@ void VsmDiagnostics::DumpDiagnosticLog()
 	// Log EVERYTHING for offline ground-truth: real world-space triangles of every caster (exact silhouettes,
 	// no box over-occlusion), then the actual shadow map from the real shader.
 	DumpGeometry();
-	DumpSkinningFull();  // COMPLETE skinning state (palette + dynamicData + per-partition bones/maps/weights/slots) -> skin.bin
+	DumpSkinningFull();   // COMPLETE skinning state (palette + dynamicData + per-partition bones/maps/weights/slots) -> skin.bin
+	DumpGpuSkinReadback();  // GPU-readback ORACLE: skin each caster on the GPU with the engine's palette -> gpuskin.bin
 	DumpSceneFull();     // EVERYTHING in the scene graph (all nodes + all geometry buffers/props/skin) -> scene.bin
 }

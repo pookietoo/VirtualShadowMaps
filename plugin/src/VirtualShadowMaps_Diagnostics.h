@@ -48,6 +48,8 @@ public:
 	void        DumpGeometry();         // every caster's REAL world-space triangles -> geom.bin sidecar
 	void        DumpSkinningFull();     // COMPLETE skinning state (palette, dynamicData, per-partition bones/maps/
 	                                    // weights/slots/positions) for every skinned caster -> skin.bin sidecar
+	void        DumpGpuSkinReadback();  // GPU-readback ORACLE: skin each caster on the GPU with the ENGINE's exact
+	                                    // palette (LBS compute shader) + read back -> gpuskin.bin (engine-side truth)
 	void        DumpSceneFull();        // EVERYTHING in the scene graph: every node's transforms/flags/bounds/
 	                                    // hierarchy + every geometry's staged GPU buffers, properties, dynamicData,
 	                                    // and FULL skin (palette, bone-world-xforms, inverse-binds, all partition

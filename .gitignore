@@ -25,6 +25,9 @@ tools/
 # ---- Local design/roadmap notes (kept locally, not part of the shipped project) ----
 notes/
 
+# ---- Local speed-testing harness (mirror benchmarks, PLAN.md) — not part of the shipped project ----
+testing/
+
 # ---- Detailed local documentation (deep architecture write-up) — not part of the shipped project ----
 docs/
 

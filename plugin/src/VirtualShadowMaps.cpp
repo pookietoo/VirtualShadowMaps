@@ -1569,12 +1569,24 @@ namespace
 	constexpr std::uint32_t kMaxSkinIdx   = 524288;
 }
 
-// SEH-isolated (POD-only locals) so __try is legal: skin ONE caster's clean BSTriShape partitions into
-// pre-allocated arrays, bounds-checked. A torn-down streaming partition faults here and is caught, leaving
-// partial-but-safe results instead of a CTD. posed = Σ weightᵢ · boneMat3x4[remap[idxᵢ]] · bindPos, and the
-// engine matrices output WORLD-absolute (verified 0.9.30). Only clean float3 layouts (posOff/skinOff+12
-// fit the stride); BSDynamicTriShape split/dynamic streams (head/hair) are handled later.
-static void VSM_SkinOneCaster(RE::BSGeometry* a_g, DirectX::XMFLOAT3* a_posed, std::uint32_t* a_idx,
+// SEH-isolated (POD-only locals) so __try is legal: CPU-skin ONE engineOnly caster — BSTriShape (body/armor)
+// OR BSDynamicTriShape (head/hair/face) — into pre-allocated arrays, bounds-checked. A torn-down streaming
+// partition faults here and is caught, leaving partial-but-safe results instead of a CTD.
+//
+// "Rule B" (0.9.95; supersedes 0.9.91/92/93). PROVEN by 4 independent agents via triangle EDGE-LENGTH checks:
+//  - The skin vertex buffer is ONE shape-GLOBAL buffer of N = sp->vertexCount unique verts; all partitions share
+//    it. `vertexMap` AND `triList` entries are GLOBAL vertex ids in [0,N) (measured triList.max()==vertexMap.max()
+//    and > p.vertices in every partition). The inline bone-slot bytes are DIRECT global palette indices
+//    (max slot == numMats-1), so NiSkinPartition::Partition::bones is VESTIGIAL in this layout.
+//  - Therefore: skin each GLOBAL vertex ONCE into [base, base+N), and emit each partition's triList directly
+//    against the caster's SINGLE vertex base. The old per-partition `partBase + triList[k]` treated the already-
+//    global triList as partition-local, so on partitions >=2 the triangle indices ran PAST the caster's block
+//    into the NEXT caster's verts in the shared skinPosed buffer -> the multi-partition explosion AND the player
+//    "cylinder" (a head's eye-partition landing on a neighbouring actor). Single-partition meshes were always
+//    fine because partBase==0. Vertex-RADIUS checks are blind to this (positions coherent, connectivity wrong).
+//  - Position source is the ONLY body/dynamic difference: dynamicData[g] (CPU-morphed model space) for a dynamic
+//    shape, else the buffer's VA_POSITION[g]. Output is WORLD-absolute (palette folds skin->world; no geom->world).
+static void VSM_SkinCaster(RE::BSGeometry* a_g, DirectX::XMFLOAT3* a_posed, std::uint32_t* a_idx,
     std::uint32_t a_maxV, std::uint32_t a_maxI, std::uint32_t& a_vCount, std::uint32_t& a_iCount)
 {
 	using namespace DirectX::PackedVector;
@@ -1584,178 +1596,114 @@ static void VSM_SkinOneCaster(RE::BSGeometry* a_g, DirectX::XMFLOAT3* a_posed, s
 		if (!skin || !skin->boneMatrices || !skin->skinPartition || skin->numMatrices == 0)
 			return;
 		auto* sp = skin->skinPartition.get();
+		const std::uint32_t N = sp->vertexCount;   // unique global vertex count == shared-buffer length
+		if (N == 0 || sp->numPartitions == 0)
+			return;
 		const float* boneMats = reinterpret_cast<const float*>(skin->boneMatrices);
 		const std::uint16_t numMats = static_cast<std::uint16_t>(skin->numMatrices);  // palette size (bounds guard)
-		const int matStrideF = static_cast<int>(skin->allocatedSize / skin->numMatrices) / static_cast<int>(sizeof(float));  // -> float count; 12 floats = 3x4
+		const int matStrideF = static_cast<int>(skin->allocatedSize / skin->numMatrices) / static_cast<int>(sizeof(float));  // -> float count; 12 = 3x4
 		if (matStrideF < 12)
 			return;
+
+		// Position source. A BSDynamicTriShape supplies CPU-morphed model-space positions in dynamicData
+		// (float4, stride 16, indexed by global vertex id); its buffer VA_POSITION is a split/empty stream and
+		// must NOT be read. A rigid BSTriShape uses the buffer's own VA_POSITION.
+		const std::uint8_t* dyn = nullptr;
+		bool isDynShape = false;
+		if (auto* dts = a_g->AsDynamicTriShape()) {
+			isDynShape = true;
+			auto& dr = dts->GetDynamicTrishapeRuntimeData();
+			if (dr.dynamicData && dr.dataSize / 16u == N)
+				dyn = reinterpret_cast<const std::uint8_t*>(dr.dynamicData);
+		}
+		if (isDynShape && !dyn)
+			return;  // dynamic shape whose dynamicData is absent/mismatched -> skip (buffer position is unusable)
+
+		// Shared global buffer + layout (identical across a shape's partitions -> read layout from partition 0).
+		auto& p0 = sp->partitions[0];
+		auto* bd0 = p0.buffData;
+		if (!bd0 || !bd0->rawVertexData)
+			return;
+		const std::uint8_t* rv = reinterpret_cast<const std::uint8_t*>(bd0->rawVertexData);
+		auto& vd = p0.vertexDesc;
+		const std::uint32_t stride  = vd.GetSize();
+		const std::uint32_t posOff  = vd.GetAttributeOffset(V::VA_POSITION);
+		const std::uint32_t skinOff = vd.GetAttributeOffset(V::VA_SKINNING);
+		const size_t kSkinBlockBytes = 4 * sizeof(std::uint16_t) + 4 * sizeof(std::uint8_t);  // 8 + 4 = 12
+		if (skinOff + kSkinBlockBytes > stride)
+			return;
+		if (!dyn && posOff + sizeof(DirectX::XMFLOAT3) > stride)
+			return;  // rigid path needs a valid float3 VA_POSITION inside the stride
+
+		// Skin only the vertex range actually REFERENCED by triangles. sp->vertexCount can EXCEED the real /
+		// referenced vertex count on some props (seen on Fish: vertexCount=54 but only 51 verts referenced), so
+		// skinning the full [0,N) would touch unreferenced entries that may be garbage — polluting the caster
+		// bounds (and risking a genuine out-of-bounds buffer read when vertexCount > the real buffer). maxRef =
+		// highest triangle index -> skin exactly [0, Nskin). (Caught by the GPU-readback oracle: Fish flew to ~2100u.)
+		std::uint32_t maxRef = 0;
+		bool anyTri = false;
 		for (std::uint32_t pi = 0; pi < sp->numPartitions; ++pi) {
 			auto& p = sp->partitions[pi];
-			auto* bd = p.buffData;
-			if (!bd || !bd->rawVertexData || !p.triList || !p.bones)
+			if (!p.triList)
 				continue;
-			auto& vd = p.vertexDesc;
-			const std::uint32_t stride  = vd.GetSize();
-			const std::uint32_t posOff  = vd.GetAttributeOffset(V::VA_POSITION);
-			const std::uint32_t skinOff = vd.GetAttributeOffset(V::VA_SKINNING);
-			// Clean float3 layout only: position is a 12-byte float3, and the skinning block is 4 weight
-			// halfs (8 bytes) + 4 bone-index bytes (4 bytes) = 12 bytes. Both must fit inside the stride.
-			const size_t kPositionBytes = sizeof(DirectX::XMFLOAT3);                              // 12
-			const size_t kSkinBlockBytes = 4 * sizeof(std::uint16_t) + 4 * sizeof(std::uint8_t);  // 8 + 4 = 12
-			if (posOff + kPositionBytes > stride || skinOff + kSkinBlockBytes > stride)
-				continue;  // not the clean float3 layout (head/hair dynamic stream) — skip for now
-			const std::uint8_t* rv = reinterpret_cast<const std::uint8_t*>(bd->rawVertexData);
-			const std::uint16_t* remap = p.bones;
-			const std::uint32_t partBase = a_vCount;  // where this partition's verts start in the global buffer
-			for (std::uint16_t v = 0; v < p.vertices; ++v) {
-				if (a_vCount >= a_maxV)
-					return;
-				const std::uint8_t* vb = rv + static_cast<size_t>(v) * stride;
-				const float* bp = reinterpret_cast<const float*>(vb + posOff);
-				const std::uint16_t* w = reinterpret_cast<const std::uint16_t*>(vb + skinOff);
-				const std::uint8_t* ib = reinterpret_cast<const std::uint8_t*>(vb + skinOff + 4 * sizeof(std::uint16_t));  // bone indices follow the 4 weight halfs (8 bytes)
-				float wx = 0.0f, wy = 0.0f, wz = 0.0f;
-				for (int b = 0; b < 4; ++b) {
-					const float wt = XMConvertHalfToFloat(w[b]);
-					if (wt <= 0.0f)
-						continue;
-					// Bounds-guard the two index hops (vertex slot -> partition remap -> global palette).
-					// An out-of-range bone slot would read a garbage matrix and hurl the vertex across the
-					// cell, and its triangles would smear into a giant sliver stuck to the character.
-					const std::uint16_t li = ib[b];  // partition-local bone slot
-					if (li >= p.numBones)
-						continue;
-					const std::uint16_t gi = remap[li];  // -> global bone index
-					if (gi >= numMats)
-						continue;
-					const float* M = boneMats + static_cast<size_t>(gi) * matStrideF;  // 3x4 row-major
-					wx += wt * (M[0] * bp[0] + M[1] * bp[1] + M[2] * bp[2] + M[3]);
-					wy += wt * (M[4] * bp[0] + M[5] * bp[1] + M[6] * bp[2] + M[7]);
-					wz += wt * (M[8] * bp[0] + M[9] * bp[1] + M[10] * bp[2] + M[11]);
-				}
-				a_posed[a_vCount++] = { wx, wy, wz };
-			}
-			const std::uint16_t* tl = p.triList;
 			const std::uint32_t nidx = static_cast<std::uint32_t>(p.triangles) * 3u;
 			for (std::uint32_t k = 0; k < nidx; ++k) {
-				if (a_iCount >= a_maxI)
-					return;
-				a_idx[a_iCount++] = partBase + tl[k];
+				const std::uint16_t gv = p.triList[k];
+				if (gv < N) { anyTri = true; if (gv > maxRef) maxRef = gv; }
 			}
 		}
-	} __except (EXCEPTION_EXECUTE_HANDLER) {
-		// partial results already written; the caller's range reflects a_iCount at return.
-	}
-}
+		if (!anyTri)
+			return;                             // no usable triangles -> nothing to render
+		const std::uint32_t Nskin = maxRef + 1;   // referenced range [0,Nskin) <= [0,N)
 
-// Path B1 — head / hair / face (BSDynamicTriShape). The engine writes CPU-MORPHED (facegen/expression)
-// model-space positions into `dynamicData` every frame (float4, 16-byte stride, xyz + w=0; dataSize ==
-// skinPartition->vertexCount * 16), but it is NOT yet skinned — a skinned mesh is placed by the BONE
-// PALETTE, not by geom->world. Applying geom->world to unskinned local verts left heads ~10x oversized
-// (adults) and scattered ~2380u (children — the character's world placement + scale live in the bones,
-// which we were skipping). So we skin `dynamicData` through the same bone palette as the body path
-// (VSM_SkinOneCaster) — the ONLY difference is the bind POSITION comes from dynamicData in DRAW order
-// (a running per-partition base + lv; dynamicData is concatenated per partition, NOT shape-vertex order —
-// see the partition loop) instead of the vertex buffer's VA_POSITION, while the WEIGHTS/bone-slots come
-// from the partition's own vertex stream at partition-local lv (VA_SKINNING). Output is WORLD-absolute;
-// NO geom->world multiply. SEH-isolated, POD-only locals, bounds-checked. (dynamicData is pre-skin
-// model space — the pre-0.9.91 "already CPU-skinned, transform by geom->world" assumption was wrong.)
-static void VSM_PosedDynamicCaster(RE::BSGeometry* a_g,
-    DirectX::XMFLOAT3* a_posed, std::uint32_t* a_idx, std::uint32_t a_maxV, std::uint32_t a_maxI,
-    std::uint32_t& a_vCount, std::uint32_t& a_iCount)
-{
-	using namespace DirectX::PackedVector;
-	using V = RE::BSGraphics::Vertex;
-	__try {
-		auto* dts = a_g->AsDynamicTriShape();
-		if (!dts)
-			return;
-		auto& dr = dts->GetDynamicTrishapeRuntimeData();
-		const std::uint8_t* dyn     = reinterpret_cast<const std::uint8_t*>(dr.dynamicData);
-		const std::uint32_t dynSize = dr.dataSize;
-		if (!dyn || dynSize < 16)
-			return;
-		auto* skin = a_g->GetGeometryRuntimeData().skinInstance.get();
-		if (!skin || !skin->boneMatrices || !skin->skinPartition || skin->numMatrices == 0)
-			return;
-		auto* sp = skin->skinPartition.get();
-		const float* boneMats = reinterpret_cast<const float*>(skin->boneMatrices);
-		const std::uint16_t numMats = static_cast<std::uint16_t>(skin->numMatrices);       // palette size (bounds guard)
-		const int matStrideF = static_cast<int>(skin->allocatedSize / skin->numMatrices) / static_cast<int>(sizeof(float));  // 12 floats = 3x4
-		if (matStrideF < 12)
-			return;
-		constexpr std::uint32_t kDynStride  = 16;  // float4 morphed model-space pos (xyz + w=0)
-		const std::uint32_t dynVertCount = dynSize / kDynStride;
-		if (dynVertCount == 0 || dynVertCount != sp->vertexCount)
-			return;  // layout we don't recognise — skip rather than risk an out-of-bounds read
-		// dynamicData is CONCATENATED in partition/draw order (each partition's compacted verts, seam verts
-		// duplicated), so dataSize/16 == sp->vertexCount == the UNIQUE count (partitions SHARE seam verts, so sum p.vertices >= unique); dynamicData AND every partition's buffData are ONE shared global buffer, indexed by vertexMap[lv]. [old note kept for context]: — NOT the shape-unique count. The
-		// bind position is indexed by a RUNNING draw-order counter, NOT vertexMap (which maps to the shape's
-		// ORIGINAL vertex order and coincides with draw order only for a SINGLE partition — the reason the
-		// explosion was 100% correlated with numPartitions>1).
-		std::uint32_t dynBase = 0;
+		const std::uint32_t base = a_vCount;   // this caster's SINGLE vertex-block start (constant across partitions)
+		if (base + Nskin > a_maxV)
+			return;                             // wouldn't fit -> skip whole caster (never partial/torn)
+
+		// (1) Skin each referenced GLOBAL vertex ONCE into [base, base+Nskin).
+		for (std::uint32_t g = 0; g < Nskin; ++g) {
+			const std::uint8_t* vb = rv + static_cast<size_t>(g) * stride;
+			const std::uint16_t* w  = reinterpret_cast<const std::uint16_t*>(vb + skinOff);
+			const std::uint8_t*  ib = reinterpret_cast<const std::uint8_t*>(vb + skinOff + 4 * sizeof(std::uint16_t));  // bone slots follow the 4 weight halfs
+			float px, py, pz;
+			if (dyn) {
+				const float* lp = reinterpret_cast<const float*>(dyn + static_cast<size_t>(g) * 16u);
+				px = lp[0]; py = lp[1]; pz = lp[2];
+			} else {
+				const float* bp = reinterpret_cast<const float*>(vb + posOff);
+				px = bp[0]; py = bp[1]; pz = bp[2];
+			}
+			float wx = 0.0f, wy = 0.0f, wz = 0.0f;
+			for (int b = 0; b < 4; ++b) {
+				const float wt = XMConvertHalfToFloat(w[b]);
+				if (wt <= 0.0f)
+					continue;
+				const std::uint16_t gi = ib[b];   // DIRECT global palette index (p.bones remap dropped)
+				if (gi >= numMats)
+					continue;
+				const float* M = boneMats + static_cast<size_t>(gi) * matStrideF;  // 3x4 row-major, skin->world
+				wx += wt * (M[0] * px + M[1] * py + M[2] * pz + M[3]);
+				wy += wt * (M[4] * px + M[5] * py + M[6] * pz + M[7]);
+				wz += wt * (M[8] * px + M[9] * py + M[10] * pz + M[11]);
+			}
+			a_posed[base + g] = { wx, wy, wz };
+		}
+		a_vCount = base + Nskin;
+
+		// (2) Triangles: triList entries are GLOBAL vertex ids -> single per-caster base, iterate ALL partitions.
 		for (std::uint32_t pi = 0; pi < sp->numPartitions; ++pi) {
 			auto& p = sp->partitions[pi];
-			const std::uint32_t thisBase = dynBase;  // this partition's slice start in dynamicData
-			dynBase += p.vertices;                   // advance for EVERY partition (even skipped) to stay aligned
-			auto* bd = p.buffData;
-			if (!bd || !bd->rawVertexData || !p.triList || !p.bones)
+			if (!p.triList)
 				continue;
-			auto& vd = p.vertexDesc;
-			const std::uint32_t stride  = vd.GetSize();
-			const std::uint32_t skinOff = vd.GetAttributeOffset(V::VA_SKINNING);
-			// Only the SKINNING block is read from this stream (position comes from dynamicData): 4 weight
-			// halfs (8B) + 4 bone-index bytes (4B) = 12 bytes. POSITION is NOT here (split dynamic stream).
-			const size_t kSkinBlockBytes = 4 * sizeof(std::uint16_t) + 4 * sizeof(std::uint8_t);  // 12
-			if (!vd.HasFlag(V::VF_SKINNED) || skinOff + kSkinBlockBytes > stride)
-				continue;
-			const std::uint8_t* rv = reinterpret_cast<const std::uint8_t*>(bd->rawVertexData);
-			const std::uint16_t* remap = p.bones;              // partition-local bone slot -> global palette index
-			const std::uint32_t partBase = a_vCount;           // this partition's first vert in the global buffer
-			for (std::uint16_t lv = 0; lv < p.vertices; ++lv) {
-				if (a_vCount >= a_maxV)
-					return;
-				// Bind position from dynamicData indexed by vertexMap (partition-local -> shape-UNIQUE index).
-				// dynamicData is unique-count (dataSize/16 == sp->vertexCount); partitions SHARE seam verts
-				// (sum p.vertices > unique), so a running draw-order counter reads the fragile DUPLICATE seam
-				// tail (dyn[sumPrior + lv]) which the runtime mis-reads -> the 2nd-partition explosion. vertexMap
-				// maps into the reliably-populated unique region only. Offline-validated against the runtime p0
-				// (exact match) to give a coherent head for BOTH partitions. Falls back to the running counter
-				// only if vertexMap is somehow absent (single-partition meshes have an identity map anyway).
-				const std::uint32_t dynIdx = p.vertexMap ? p.vertexMap[lv] : (thisBase + lv);
-				float bx = 0.0f, by = 0.0f, bz = 0.0f;
-				if (dynIdx >= dynVertCount) { a_posed[a_vCount++] = { 0.0f, 0.0f, 0.0f }; continue; }  /* OOB of shared buffer */ {
-					const float* lp = reinterpret_cast<const float*>(dyn + static_cast<size_t>(dynIdx) * kDynStride);
-					bx = lp[0]; by = lp[1]; bz = lp[2];
-				}  // else bindPos stays 0 -> skins to the weighted bone origins (near the actor, not world (0,0,0))
-				// Weights + bone slots: from the shared global vertex buffer at the SAME global index as the position.
-				const std::uint8_t* vb = rv + static_cast<size_t>(dynIdx) * stride;  // GLOBAL index (buffData is one shared global buffer), SAME as position
-				const std::uint16_t* w  = reinterpret_cast<const std::uint16_t*>(vb + skinOff);
-				const std::uint8_t*  ib = reinterpret_cast<const std::uint8_t*>(vb + skinOff + 4 * sizeof(std::uint16_t));
-				float wx = 0.0f, wy = 0.0f, wz = 0.0f;
-				for (int b = 0; b < 4; ++b) {
-					const float wt = XMConvertHalfToFloat(w[b]);
-					if (wt <= 0.0f)
-						continue;
-					const std::uint16_t li = ib[b];   // partition-local bone slot
-					if (li >= p.numBones)
-						continue;
-					const std::uint16_t gi = remap[li];  // -> global palette index
-					if (gi >= numMats)
-						continue;
-					const float* M = boneMats + static_cast<size_t>(gi) * matStrideF;  // 3x4 row-major, skin->world
-					wx += wt * (M[0] * bx + M[1] * by + M[2] * bz + M[3]);
-					wy += wt * (M[4] * bx + M[5] * by + M[6] * bz + M[7]);
-					wz += wt * (M[8] * bx + M[9] * by + M[10] * bz + M[11]);
-				}
-				a_posed[a_vCount++] = { wx, wy, wz };  // WORLD-absolute (palette folds skin->world); no geom->world
-			}
 			const std::uint16_t* tl = p.triList;
 			const std::uint32_t nidx = static_cast<std::uint32_t>(p.triangles) * 3u;
 			for (std::uint32_t k = 0; k < nidx; ++k) {
 				if (a_iCount >= a_maxI)
 					return;
-				a_idx[a_iCount++] = partBase + tl[k];
+				const std::uint16_t gv = tl[k];
+				if (gv >= Nskin)
+					continue;   // guard: keep the index inside this caster's skinned [base, base+Nskin) block
+				a_idx[a_iCount++] = base + gv;
 			}
 		}
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1789,19 +1737,17 @@ void VirtualShadowMaps::SkinAllCasters()
 		const std::uint32_t v0 = vCount;
 		const std::uint32_t i0 = iCount;
 
-		// Dispatch by class: BSDynamicTriShape (head/hair/face) is already CPU-skinned by the engine
-		// into dynamicData — transform-only (Path B1). Everything else is a GPU-skinned BSTriShape we
-		// skin ourselves from bind pose + bone palette (Path B).
+		// One unified skin path (Rule B): VSM_SkinCaster handles BOTH the rigid BSTriShape (bind pose +
+		// palette) and the BSDynamicTriShape (position from dynamicData) — they differ only in position source.
+		// For a dynamic shape the engine writes dynamicData (facegen/expression/morph) ASYNC under this spinlock;
+		// read it unlocked and we race the writer -> torn positions. So take the lock around the dynamic read.
 		if (auto* dts = g->AsDynamicTriShape(); dts && dts->GetDynamicTrishapeRuntimeData().dynamicData) {
-			// The engine writes dynamicData (facegen/expression/morph) asynchronously and guards every access
-			// with this spinlock. Reading it unlocked races the writer -> torn positions in the seam/duplicate
-			// region -> live-only head explosions (offline dumps read settled data, so they looked coherent).
 			auto& dr = dts->GetDynamicTrishapeRuntimeData();
 			dr.lock.Lock();
-			VSM_PosedDynamicCaster(g, skinPosed.data(), skinIndices.data(), kMaxSkinVerts, kMaxSkinIdx, vCount, iCount);
+			VSM_SkinCaster(g, skinPosed.data(), skinIndices.data(), kMaxSkinVerts, kMaxSkinIdx, vCount, iCount);
 			dr.lock.Unlock();
 		} else {
-			VSM_SkinOneCaster(g, skinPosed.data(), skinIndices.data(), kMaxSkinVerts, kMaxSkinIdx, vCount, iCount);
+			VSM_SkinCaster(g, skinPosed.data(), skinIndices.data(), kMaxSkinVerts, kMaxSkinIdx, vCount, iCount);
 		}
 		if (iCount <= i0)
 			continue;  // nothing produced this caster
