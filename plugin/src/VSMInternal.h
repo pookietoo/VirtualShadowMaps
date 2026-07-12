@@ -16,7 +16,7 @@ namespace vsm::internal
 	// plugin DLL is actually running. Bump the description each build. (The SKSE plugin version
 	// number is separate — see Plugin.h / CMake project VERSION.)
 	inline constexpr char kBuildTag[] =
-	    "0.9.97 - correctness batch (UNTESTED): removed the redundant radius fade (matches CS light attenuation), added normal-offset self-shadow bias, and alpha-tested cutout clip (config alphaTestedShadows, default off).";
+	    "0.9.98 - O10 spatial caster grid (config spatialCasterIndex, default off, UNTESTED): each light's cube cull queries only nearby casters via a world-space uniform grid, cutting the render cull toward O(#lights); drawn set is harness-verified identical to the exhaustive scan.";
 
 	// Depth convention for the shadow atlas. TRUE = reverse-Z (near->1, far->0), which is Skyrim's own
 	// main-view convention and gives uniform float-depth precision across the light's range. This flag is the

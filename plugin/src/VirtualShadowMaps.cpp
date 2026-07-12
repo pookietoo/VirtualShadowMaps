@@ -924,14 +924,14 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 	}
 
 	// Gather ALL active local lights (not the engine's shadow-limited subset) — the point
-	// of the mod is to shadow lights the engine dropped. Cap at kMaxLights (correctness-
-	// first; the cap lifts once culling/paging land). Each light gets a cube "block" laid
-	// out in a kLightsPerRow grid in the atlas.
+	// of the mod is to shadow lights the engine dropped. NO cap: each light later gets a
+	// variable-resolution 3x2 cube-face block shelf-packed into the atlas by PackAtlas (both
+	// the atlas texture and the per-light GPU buffer grow to fit — EnsureLightBuffer).
 	float nearestDistSq = FLT_MAX;
 	int   nearestIdx    = -1;
 
 	// Add one scene-graph light to the buffer, deduped by world position (a light can appear
-	// in both arrays). Returns false once the atlas is full so the caller stops. We collect
+	// in both arrays). ALWAYS returns true (no light cap; the bool is a vestige of the old capped design). We collect
 	// BOTH activeLights AND activeShadowLights — matching LLF's light set exactly — so
 	// shadow-casting lights (braziers etc., which live in activeShadowLights) also get cubes.
 	// The sun and origin-positioned lights are skipped.
@@ -1922,6 +1922,78 @@ void VirtualShadowMaps::BuildCasterBounds()
 		casterWorldSphere[i] = { 0.5f * (worldMin.x + worldMax.x), 0.5f * (worldMin.y + worldMax.y), 0.5f * (worldMin.z + worldMax.z),
 		    std::sqrt(hx * hx + hy * hy + hz * hz) };
 	}
+
+	// O10: (re)build the world-space caster grid from the fresh spheres, or drop it if the toggle is off.
+	if (vsm::GetConfig().spatialCasterIndex)
+		BuildCasterGrid();
+	else
+		casterGrid.clear();
+}
+
+// O10 tuning. The query half-extent is ADDITIVE (1.02*farPlane + kCasterGridRadiusK*maxCasterRadius), not a flat
+// multiple of the radius: SphereInFrustum is a PLANE test, so at a cube face's far-plane corner the two 45deg-tilted
+// side planes admit a passing sphere whose CENTER sits up to ~1.414x its radius laterally beyond the true frustum.
+// A flat radius multiple drops those casters (verified: a naive 1.10x cube mismatched the exhaustive scan by ~0.2%
+// on every scenario); the additive radius term covers them and keeps the candidate set a provable superset. The
+// 1.02 factor covers the ~90.45deg guard-band FOV whose own far corner sits at 1.008*farPlane per axis.
+static constexpr float kCasterGridFovGuard = 1.02f;
+static constexpr float kCasterGridRadiusK  = 2.0f;   // > 0.414 (the 1.414x lateral push minus the radius itself); generous.
+
+static int VSM_FloorDiv(float v, float cell) { return static_cast<int>(std::floor(v / cell)); }
+
+// Bin every caster with a valid world sphere into casterGrid, keyed by the cells its sphere-AABB spans, and record
+// the largest radius (sizes the query bound). O(#casters); rebuilt each frame (the harness timed build+query
+// together and still measured the O(#lights) win). NOTE: a future refinement builds a STATIC grid once per cell and
+// only re-bins dynamics; this per-frame rebuild is the simplest form that matches the verified algorithm.
+void VirtualShadowMaps::BuildCasterGrid()
+{
+	casterGrid.clear();
+	if (casterQuerySeen.size() < registry.size())
+		casterQuerySeen.assign(registry.size(), 0);  // grow the stamp-dedup array with the registry
+	const float cell = casterGrid.cell;
+	for (std::uint32_t i = 0; i < casterWorldSphere.size(); ++i) {
+		const auto& s = casterWorldSphere[i];
+		if (s.w < 0.0f)
+			continue;  // no sphere (skinned/engineOnly) -> not gridded; those draw via skinnedRanges
+		if (s.w > casterGrid.maxRadius)
+			casterGrid.maxRadius = s.w;
+		const int x0 = VSM_FloorDiv(s.x - s.w, cell), x1 = VSM_FloorDiv(s.x + s.w, cell);
+		const int y0 = VSM_FloorDiv(s.y - s.w, cell), y1 = VSM_FloorDiv(s.y + s.w, cell);
+		const int z0 = VSM_FloorDiv(s.z - s.w, cell), z1 = VSM_FloorDiv(s.z + s.w, cell);
+		for (int x = x0; x <= x1; ++x)
+			for (int y = y0; y <= y1; ++y)
+				for (int z = z0; z <= z1; ++z)
+					casterGrid.cells[CasterGrid::Key(x, y, z)].push_back(i);
+	}
+}
+
+// Gather the registry indices of casters near a light: the cells its query cube (see kCasterGridFovGuard) overlaps,
+// stamp-deduped into a_out. A conservative superset of every caster that could pass any of the light's 6 face
+// frustums, so the caller's per-face SphereInFrustum refine reproduces the exhaustive scan's drawn set exactly.
+void VirtualShadowMaps::QueryCasterGrid(const LightRecord& a_light, std::vector<std::uint32_t>& a_out)
+{
+	a_out.clear();
+	if (++casterQueryStamp == 0) {  // stamp wrapped (2^32 queries) -> reset so stale marks can't false-match
+		std::fill(casterQuerySeen.begin(), casterQuerySeen.end(), 0u);
+		casterQueryStamp = 1;
+	}
+	const float cell = casterGrid.cell;
+	const float qr   = a_light.farPlane * kCasterGridFovGuard + kCasterGridRadiusK * casterGrid.maxRadius;
+	const int x0 = VSM_FloorDiv(a_light.positionWS.x - qr, cell), x1 = VSM_FloorDiv(a_light.positionWS.x + qr, cell);
+	const int y0 = VSM_FloorDiv(a_light.positionWS.y - qr, cell), y1 = VSM_FloorDiv(a_light.positionWS.y + qr, cell);
+	const int z0 = VSM_FloorDiv(a_light.positionWS.z - qr, cell), z1 = VSM_FloorDiv(a_light.positionWS.z + qr, cell);
+	for (int x = x0; x <= x1; ++x)
+		for (int y = y0; y <= y1; ++y)
+			for (int z = z0; z <= z1; ++z) {
+				auto it = casterGrid.cells.find(CasterGrid::Key(x, y, z));
+				if (it == casterGrid.cells.end())
+					continue;
+				for (std::uint32_t idx : it->second)
+					if (casterQuerySeen[idx] != casterQueryStamp) {
+						casterQuerySeen[idx] = casterQueryStamp;
+						a_out.push_back(idx);
+					}
+			}
 }
 
 // Walk a scene-graph node's parent chain and return the FIRST ancestor carrying a TESObjectREFR (the ref the
@@ -2161,20 +2233,36 @@ void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 	// draws (opaque buffer casters matching the filter via casterWorldSphere; skinned ranges when a_drawSkinned).
 	// Conservative: culls only when provably empty; the default-off toggle keeps the baseline untouched.
 	const bool cullEmpty = vsm::GetConfig().cullEmptyLightPasses;
+	// O10: when spatialCasterIndex is on and a grid was built, each light iterates only NEARBY casters (the grid
+	// query) instead of the whole registry. `cand == nullptr` means "iterate all of registry" — the exact prior
+	// behavior — so the default-off path is byte-for-byte unchanged. The candidate set is a conservative superset,
+	// so DrawStaticCaster's own per-face SphereInFrustum refine still yields the identical drawn set.
+	const bool useGrid = vsm::GetConfig().spatialCasterIndex && !casterGrid.cells.empty();
 	for (const auto& light : lightRecords) {
+		const std::vector<std::uint32_t>* cand = nullptr;
+		if (useGrid) {
+			QueryCasterGrid(light, casterQueryScratch);
+			cand = &casterQueryScratch;
+		}
+		// Run `body(i)` over the candidate registry indices (grid) or the whole registry (brute), identically.
+		auto forEachCaster = [&](auto&& body) {
+			if (cand) { for (std::uint32_t i : *cand) body(static_cast<size_t>(i)); }
+			else      { for (size_t i = 0; i < registry.size(); ++i) body(i); }
+		};
 		if (cullEmpty) {
 			const float lx = light.positionWS.x, ly = light.positionWS.y, lz = light.positionWS.z;
 			const float lr = light.farPlane;  // far plane == light radius
 			bool any = false;
-			for (size_t i = 0; i < registry.size() && !any; ++i) {
-				if (registry[i].isTranslucent) continue;                 // glass never draws in the opaque passes
-				if (a_filter == 1 && !registry[i].isStatic) continue;
-				if (a_filter == 2 && registry[i].isStatic) continue;
+			forEachCaster([&](size_t i) {
+				if (any) return;
+				if (registry[i].isTranslucent) return;                   // glass never draws in the opaque passes
+				if (a_filter == 1 && !registry[i].isStatic) return;
+				if (a_filter == 2 && registry[i].isStatic) return;
 				const auto& s = casterWorldSphere[i];
-				if (s.w < 0.0f) continue;                                // no sphere (skinned/engineOnly) -> checked below
+				if (s.w < 0.0f) return;                                   // no sphere (skinned/engineOnly) -> checked below
 				const float dx = s.x - lx, dy = s.y - ly, dz = s.z - lz;
 				if (std::sqrt(dx * dx + dy * dy + dz * dz) - s.w <= lr) any = true;
-			}
+			});
 			if (!any && a_drawSkinned)
 				for (const auto& r : skinnedRanges) {
 					const float dx = r.center.x - lx, dy = r.center.y - ly, dz = r.center.z - lz;
@@ -2184,11 +2272,11 @@ void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 				continue;  // no caster reaches this light -> skip all 6 faces (no viewport/matrix/clear/draw)
 		}
 		ForEachLightFace(light, [&](const XMMATRIX& faceVP, const XMFLOAT4* planes) {
-			for (size_t i = 0; i < registry.size(); ++i) {
-				if (a_filter == 1 && !registry[i].isStatic) continue;   // static-only pass
-				if (a_filter == 2 &&  registry[i].isStatic) continue;   // dynamic-only pass
+			forEachCaster([&](size_t i) {
+				if (a_filter == 1 && !registry[i].isStatic) return;     // static-only pass
+				if (a_filter == 2 &&  registry[i].isStatic) return;     // dynamic-only pass
 				DrawStaticCaster(i, faceVP, planes, blinkOff);
-			}
+			});
 			// --- Path B: skinned characters (world-absolute posed buffer -> same cube VP, world=identity) ---
 			if (a_drawSkinned && skinnedVB && skinnedIB && !skinnedRanges.empty()) {
 				ID3D11Buffer* svb = skinnedVB.Get();

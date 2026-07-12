@@ -66,6 +66,10 @@ namespace
 		    "# Alpha-tested cutout shadows (A6, default false): foliage / grates / chain / hair sample their diffuse alpha\n"
 		    "# and clip() in the depth pass, casting punched-through silhouettes instead of solid quads. Fail-safe.\n"
 		    "alphaTestedShadows = {}\n"
+		    "# Performance (O10, default false): bin shadow casters into a world-space uniform grid so each light's cube-face\n"
+		    "# cull only tests NEARBY casters -> render cull scales with light count, not lights x total casters. The drawn\n"
+		    "# shadow set is identical to the exhaustive scan (verified in the offline harness). UNTESTED in-game.\n"
+		    "spatialCasterIndex = {}\n"
 		    "\n"
 		    "# Per-shape shadow-caster overrides. Match the caster's model NIF path (as a substring — use path\n"
 		    "# fragments like '\\effects\\', '\\magic\\', '\\lod\\') and/or its shape name (WHOLE-TOKEN: a name is\n"
@@ -80,9 +84,9 @@ namespace
 		    "forceCast   = {}\n"
 		    "forceNoCast = {}\n"
 		    "\n"
-		    "# [atlas] is COMPILE-TIME (baked into the shipped shader + GPU buffer sizing). Shown for\n"
-		    "# reference only; changing it here has NO effect until the plugin is rebuilt with new\n"
-		    "# values in VSMConstants.h.\n"
+		    "# [atlas] is COMPILE-TIME FALLBACK only. At runtime, face resolution derives from iShadowMapResolution\n"
+		    "# and the atlas + light buffer are sized and GROWN on demand; kMaxLights/kFaceRes are initial sizes,\n"
+		    "# NOT a hard cap. Changing [atlas] here has NO effect (rebuild with new VSMConstants.h to change fallbacks).\n"
 		    "[atlas]\n"
 		    "faceResolution = {}\n"
 		    "maxLights      = {}\n",
@@ -94,6 +98,7 @@ namespace
 		    c.translucentShadows,
 		    c.cullEmptyLightPasses,
 		    c.alphaTestedShadows,
+		    c.spatialCasterIndex,
 		    ToTomlArray(c.forceCast),
 		    ToTomlArray(c.forceNoCast),
 		    vsm::kFaceRes, vsm::kMaxLights);
@@ -133,6 +138,7 @@ namespace vsm
 		translucentShadows = tbl["general"]["translucentShadows"].value_or(translucentShadows);
 		cullEmptyLightPasses = tbl["general"]["cullEmptyLightPasses"].value_or(cullEmptyLightPasses);
 		alphaTestedShadows   = tbl["general"]["alphaTestedShadows"].value_or(alphaTestedShadows);
+		spatialCasterIndex   = tbl["general"]["spatialCasterIndex"].value_or(spatialCasterIndex);
 
 		// [classification] pattern lists (arrays of strings). Absent section => leave empty (no override).
 		forceCast.clear();

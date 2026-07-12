@@ -158,8 +158,9 @@ private:
 	// Runtime atlas dimensions, derived from the game's iShadowMapResolution ini at startup (compile-time
 	// vsm::kFaceRes etc. are the fallback). Lets the per-cube-face resolution track the user's shadow-quality
 	// setting; uploaded to the shader via the b13 cbuffer (gFaceRes/gAtlasH) so sampling matches the texture
-	// we actually allocate. NOTE: the dense atlas holds kMaxLights x 6 faces, so faceRes is bounded for now
-	// (VRAM); the uncapped, full-ini-resolution path arrives with active-light / virtual sizing.
+	// we actually allocate. The atlas is packed with per-light variable-resolution blocks (PackAtlas) and
+	// grows on demand — no fixed kMaxLights x 6 layout; each light's faceRes rung tracks its on-screen size
+	// up to iShadowMapResolution (uncapped lights, variable resolution — both shipped).
 	int rtFaceRes = vsm::kFaceRes, rtBlockW = vsm::kBlockW, rtBlockH = vsm::kBlockH, rtAtlasW = vsm::kAtlasW, rtAtlasH = vsm::kAtlasH;
 	// Variable-resolution ladder bounds, from iShadowMapResolution (ComputeAtlasDims). rtMaxFaceRes = top rung
 	// (exact ini value); rtFloorFaceRes = smallest rung (min(kFloorFaceRes, max)). Per-light faceRes rides in
@@ -348,6 +349,34 @@ private:
 	// Fill casterWorldSphere per-frame from each caster's CURRENT world AABB (GetFreshWorldAABB) — one space
 	// with the draw (absolute world via geom->world), so no worldBound.center anywhere in RenderDepth's cull.
 	void BuildCasterBounds();
+
+	// --- O10 (config.spatialCasterIndex, default OFF): world-space uniform caster grid ---------------------
+	// Each light's 6-face cull would otherwise plane-test EVERY caster (O(lights x casters)); the harness
+	// measured that at 3.48 s/frame at scale. Binning caster spheres into a coarse world grid lets a light
+	// query only the cells its bounding cube overlaps -> O(#lights x local density). Built each frame from
+	// casterWorldSphere in BuildCasterBounds (only when the toggle is on); queried per light in
+	// RenderCasterPass. The candidate set is a conservative SUPERSET, so the per-face SphereInFrustum refine
+	// then yields the IDENTICAL drawn shadow set as the exhaustive scan (verified offline in testing/).
+	struct CasterGrid
+	{
+		float cell      = 512.0f;   // world units per cell (~median light radius; a coarse bucket, not tight)
+		float maxRadius = 0.0f;     // largest binned caster radius -> sizes the conservative query bound
+		std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> cells;  // cell key -> registry indices
+		void clear() { maxRadius = 0.0f; cells.clear(); }
+		// Pack a signed cell coord into 21 bits/axis (biased); +/-2^20 cells * 512u covers any Skyrim coordinate.
+		static std::uint64_t Key(int x, int y, int z)
+		{
+			auto u = [](int v) { return static_cast<std::uint64_t>(static_cast<std::uint32_t>(v + (1 << 20))); };
+			return (u(x) << 42) | (u(y) << 21) | u(z);
+		}
+	};
+	CasterGrid                    casterGrid;             // rebuilt each frame when spatialCasterIndex is on
+	std::vector<std::uint32_t>    casterQueryScratch;     // reused per-light candidate list (no per-light alloc)
+	std::vector<std::uint32_t>    casterQuerySeen;        // stamp-dedup, parallel to registry
+	std::uint32_t                 casterQueryStamp = 0;   // bumped per query; seen[i]==stamp => already a candidate
+	void BuildCasterGrid();                                      // bin casterWorldSphere into casterGrid
+	void QueryCasterGrid(const LightRecord& a_light, std::vector<std::uint32_t>& a_out);  // nearby registry indices
+
 	std::vector<LightRecord>         lightRecords;   // all shadowed lights this frame (NO cap; buffer grows to fit)
 	std::vector<std::string>         lightNames;     // parallel to lightRecords: NiLight name (identify the camera light)
 	std::vector<RE::FormID>          lightOwnerRef;  // parallel to lightRecords: the light's TESObjectREFR (GetUserData) — drives the ref-cull

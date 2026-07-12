@@ -8,10 +8,11 @@
 //   Data/SKSE/Plugins/VirtualShadowMaps.toml
 //
 // Only values that are SAFE to change at runtime live here — they feed the b13 tuning
-// cbuffer or the CPU-side caster/light gathering. The atlas GEOMETRY (face resolution,
-// light cap) stays compile-time in VSMConstants.h because it's baked into the shipped
-// shader + GPU buffer sizing; Load() validates the file's [atlas] section against those
-// compiled values and warns on mismatch rather than silently (and wrongly) applying it.
+// cbuffer or the CPU-side caster/light gathering. The [atlas] values in VSMConstants.h are
+// COMPILE-TIME FALLBACK only: at runtime face resolution derives from iShadowMapResolution and
+// the atlas + light buffer are sized and GROWN on demand (ComputeAtlasDims/PackAtlas/
+// EnsureLightBuffer). kMaxLights/kFaceRes are initial sizes, NOT a hard cap. Load() validates
+// the file's [atlas] section against the compiled fallbacks and warns on mismatch.
 // ============================================================================
 namespace vsm
 {
@@ -31,6 +32,9 @@ namespace vsm
 		bool  alphaTestedShadows   = false;  // A6 (default OFF): alpha-TESTED cutouts (foliage/grates/chain/hair) sample their diffuse
 		                                     // alpha + clip() in the depth pass so they cast punched-through SILHOUETTES, not solid quads.
 		                                     // Fail-safe: any caster we can't fully wire (no diffuse SRV / no UV) falls back to a solid quad.
+		bool  spatialCasterIndex   = false;  // O10 perf (default OFF): bin casters into a world-space uniform grid so each light's
+		                                     // 6-face cull queries only NEARBY casters -> render cull O(#lights) instead of O(lights x
+		                                     // casters). Draw set is identical to the brute-force scan (harness-verified); UNTESTED in-game.
 
 		// [classification] — per-shape shadow-caster overrides matched against the caster's model NIF path
 		// (substring, e.g. '\effects\') and shape name (WHOLE-TOKEN, so 'marker' hits 'EditorMarker' but not

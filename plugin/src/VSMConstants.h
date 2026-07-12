@@ -11,17 +11,19 @@
 // plugin's own preview shader use the RUNTIME dims (via the b13 cbuffer / dimension-agnostic sampling) —
 // NOT these constants. (The old GPU compute probe that baked these in was removed for exactly that reason.)
 // kMaxLights is only the INITIAL light-buffer/atlas capacity (both grow on demand — NO hard cap on lights);
-// kLightsPerRow is the atlas grid stride; the k*Res/k*Atlas* here are only the initial sizing.
+// kLightsPerRow factors ONLY into the initial/fallback atlas-size math below — NOT a runtime packing
+// stride (the runtime packer targets kAtlasBlocksWide); the k*Res/k*Atlas* here are only initial sizing.
 // ============================================================================
 namespace vsm
 {
 	// ---- Shadow atlas layout ----
-	// Every active light gets a 3x2 cube-face "block"; blocks tile the atlas in a grid.
-	// Correctness-first: modest per-face resolution + a light cap. Both scale up once the
-	// culling/paging work (Phase 2) lands.
+	// Every active light gets a 3x2 cube-face "block"; PackAtlas shelf-packs the variable-size
+	// blocks and the atlas texture grows on demand (NOT a fixed grid). Per-face resolution is
+	// variable (AssignFaceRes ladder) and lights are uncapped — both already implemented; the
+	// constants below are only compile-time fallback / initial sizing.
 	inline constexpr int kFaceRes       = 256;             // one cube face, in texels
 	inline constexpr int kMaxLights     = 32;             // INITIAL light-buffer + atlas capacity (BOTH grow on demand via EnsureLightBuffer/PackAtlas — NOT a hard cap on shadow lights)
-	inline constexpr int kLightsPerRow  = 4;              // light-blocks per atlas row
+	inline constexpr int kLightsPerRow  = 4;              // ONLY factors into the fallback kAtlasW/kAtlasH below (runtime packer uses kAtlasBlocksWide)
 	inline constexpr int kCubeFacesWide = 3;              // a light's cube-face block is 3 faces wide (+X -X +Y)...
 	inline constexpr int kCubeFacesTall = 2;              // ...and 2 faces tall (-Y +Z -Z) — one 3x2 block per light
 	inline constexpr int kBlockW        = kFaceRes * kCubeFacesWide;   // 768: three faces wide

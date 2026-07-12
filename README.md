@@ -27,14 +27,14 @@ Opt-in performance modules (default **off**, toggled live in the menu) — stati
 caching (with an optional per-light *incremental* re-bake), and off-screen light culling. Enable them
 to trade a little accuracy for speed once you've confirmed the baseline looks right.
 
-Newer modules, **implemented but not yet validated in-game** (treat as experimental): a far-distance
-fade that softens a shadow toward the edge of its light's radius, and **colored translucent shadows**
-(default off) — glass / alpha-blended surfaces dim and tint the light passing through them instead of
-being excluded. The translucent module additionally needs the matching Community Shaders build (see
-below).
+Newer modules, **implemented but not yet validated in-game** (treat as experimental): **colored
+translucent shadows** (default off) — glass / alpha-blended surfaces dim and tint the light passing
+through them instead of being excluded. The translucent module additionally needs the matching
+Community Shaders build (see below).
 
-Only opaque, solid, camera-independent geometry is treated as a hard occluder; billboards,
-decals, and engine "does not cast" meshes are excluded, and head/hair skinned meshes don't yet cast.
+Only opaque, solid, camera-independent geometry is treated as a hard occluder; billboards, decals, and
+engine "does not cast" meshes are excluded. Head/hair skinned meshes **do** cast (as solid silhouettes);
+alpha-tested cutout transparency for hair cards isn't wired for skinned meshes yet.
 
 ## Building
 
@@ -80,7 +80,9 @@ over.
 The `.toml` also carries optional, **off-by-default** modules, each documented inline in the file:
 colored translucent shadows (`translucentShadows`), static-shadow caching (`cacheStaticShadows` /
 `incrementalCache`), alpha-tested cutout silhouettes for foliage/grates (`alphaTestedShadows`),
-per-shape cast overrides (`forceCast` / `forceNoCast`), and a couple of performance toggles.
+per-shape cast overrides (`forceCast` / `forceNoCast`), and performance toggles including empty-light-pass
+culling (`cullEmptyLightPasses`) and a world-space spatial caster index (`spatialCasterIndex`) that scales
+the shadow cull with light count rather than lights × casters.
 
 ## Relationship to Community Shaders & License
 
