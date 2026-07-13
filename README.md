@@ -1,9 +1,9 @@
 # Virtual Shadow Maps
 
-**Real shadows for Skyrim's local lights — beyond the engine's shadow budget.**
+**Real shadows for Skyrim's local lights.**
 
-Skyrim only shadow-casts a handful of local lights at once; the rest illuminate but throw no
-shadow. Virtual Shadow Maps is a standalone [SKSE](https://skse.silverlock.org/) plugin that
+Skyrim only allows shadows from a handful of local lights at once. Virtual Shadow Maps is a 
+standalone [SKSE](https://skse.silverlock.org/) plugin that
 renders its **own** cube-shadow atlas for the active local lights the engine dropped, and feeds it
 to [Community Shaders](https://github.com/doodlum/skyrim-community-shaders)' Light Limit Fix so its
 `Lighting.hlsl` samples our shadows. The plugin owns all of its logic — Community Shaders only
