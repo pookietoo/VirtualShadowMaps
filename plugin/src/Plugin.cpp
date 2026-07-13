@@ -1,6 +1,8 @@
 #include "VirtualShadowMaps.h"
 #include "Plugin.h"
 
+#include "RE/B/BSShadowFrustumLight.h"
+#include "RE/B/BSShadowParabolicLight.h"
 #include <imgui.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
@@ -41,6 +43,16 @@ extern "C" DLLEXPORT void VSM_GetTransmittanceResource(ID3D11ShaderResourceView*
 {
 	if (a_transAtlas)
 		*a_transAtlas = VirtualShadowMaps::GetSingleton()->GetTransmittanceSRV();
+}
+
+// LLF light-index alignment (Option c): map a BSLight* to its slot in our ShadowLights (t111) buffer, so LLF can
+// stamp that index into each Light struct (Lighting.hlsl then indexes our shadow record directly — O(1) — instead
+// of the shader searching all lights per pixel). Returns 0xFFFFFFFF (VirtualShadowMaps::kNoShadowIndex) when the
+// light has no shadow record this frame; LLF writes that sentinel and the shader renders the light unshadowed
+// (fail-safe). SEPARATE additive export: an older CS that never calls it is unaffected. See docs/ARCHITECTURE §6.1.
+extern "C" DLLEXPORT std::uint32_t VSM_GetLightShadowIndex(const void* a_bsLight)
+{
+	return VirtualShadowMaps::GetSingleton()->GetLightShadowIndex(a_bsLight);
 }
 
 namespace
@@ -110,7 +122,7 @@ namespace
 			return;
 		auto getImGui = reinterpret_cast<void (*)(ImGuiContext**, ImGuiMemAllocFunc*, ImGuiMemFreeFunc*, void**)>(
 		    GetProcAddress(cs, "CS_GetImGui"));
-		auto reg = reinterpret_cast<void (*)(void (*)())>(GetProcAddress(cs, "CS_RegisterExternalMenu"));
+		auto reg = reinterpret_cast<void (*)(const char*, const char*, void (*)())>(GetProcAddress(cs, "CS_RegisterExternalMenu"));
 		if (!getImGui || !reg)
 			return;  // CS build lacks the add-on hook
 		ImGuiContext* ctx = nullptr;
@@ -122,7 +134,14 @@ namespace
 			return;  // CS menu not initialized yet; retry next frame
 		ImGui::SetCurrentContext(ctx);
 		ImGui::SetAllocatorFunctions(alloc, free, ud);
-		reg(&ExternalDrawMenu);
+#if VSM_DIAGNOSTICS
+		// Dev build: keep the diagnostics panel floating at the top of the CS window
+		// (empty category = original top-of-window hook) — always visible, no clicking in.
+		reg("Virtual Shadow Maps", "", &ExternalDrawMenu);
+#else
+		// Deployment build: list under the CS "Lighting" category beside Light Limit Fix, our host feature.
+		reg("Virtual Shadow Maps", "Lighting", &ExternalDrawMenu);
+#endif
 		done = true;
 		VSM_LOG("VSM: registered menu with Community Shaders");
 	}
@@ -161,6 +180,28 @@ namespace
 		spdlog::set_pattern("[%H:%M:%S.%e] [%l] [%s:%#] %v");
 	}
 
+	// ---- Q1: suppress the engine's native LOCAL-light shadow-map generation ---------------------
+	// The engine still renders shadow maps for spot (BSShadowFrustumLight) and point/omni
+	// (BSShadowParabolicLight) shadow-casting lights every frame, even though VSM replaces those
+	// shadows with our atlas and our forked Lighting.hlsl no longer samples the engine's local mask
+	// (shadowComponent = 1.0). That generation is pure wasted GPU. We no-op each light's Render()
+	// (BSShadowLight vtable index 0x0A) so the engine skips it. The SUN (BSShadowDirectionalLight) is
+	// deliberately LEFT ALONE — its shadow is Skyrim's, not ours.
+	// NOTE: the engine already tolerates a varying shadow-light count frame to frame (scenes with no
+	// local shadow casters are normal), so leaving a_index unadvanced is within its normal range.
+	// UNVERIFIED in-game — if shadows/stability regress, this hook is the first suspect (self-contained).
+	void SkipLocalShadowRender(RE::BSShadowLight*, std::uint32_t&) {}  // intentionally render nothing
+
+	void InstallLocalShadowSuppress()
+	{
+		REL::Relocation<std::uintptr_t> frustumVtbl{ RE::VTABLE_BSShadowFrustumLight[0] };      // spot lights
+		REL::Relocation<std::uintptr_t> parabolicVtbl{ RE::VTABLE_BSShadowParabolicLight[0] };  // point/omni lights
+		// write_vfunc returns the original; we never call it back (we permanently skip), so discard safely.
+		[[maybe_unused]] const auto origFrustum   = frustumVtbl.write_vfunc(0x0A, &SkipLocalShadowRender);
+		[[maybe_unused]] const auto origParabolic = parabolicVtbl.write_vfunc(0x0A, &SkipLocalShadowRender);
+		VSM_LOG("VSM: engine local-light shadow generation suppressed (spot + omni Render() no-op'd; sun untouched)");
+	}
+
 	void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
 	{
 		if (a_msg->type != SKSE::MessagingInterface::kDataLoaded)
@@ -188,6 +229,7 @@ namespace
 
 		VirtualShadowMaps::GetSingleton()->OnD3DReady(device, context);
 		InstallPresentHook(swapChain);
+		InstallLocalShadowSuppress();  // Q1: stop the engine wasting GPU on local-light shadow maps VSM replaces
 #if VSM_DIAGNOSTICS
 		InstallContextHook(context);  // for the real-shader pixel probe (only acts while armed)
 #endif

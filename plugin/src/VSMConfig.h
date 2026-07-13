@@ -19,7 +19,7 @@ namespace vsm
 	struct Config
 	{
 		// [general]
-		bool  enabled       = false;  // start with the feature OFF
+		bool  enabled       = true;   // deployment: always ON (uninstall the mod to disable); DEV build can toggle/persist it
 		float qualityFactor = 1.0f;   // k: target shadow texels per screen pixel (variable-res level picker); 1 = critically sampled
 		bool  cacheStaticShadows = false;  // P2 module (default OFF): cache static-geometry depth, re-render only dynamics each frame
 		bool  cullCasters        = false;  // P3 module (default OFF): drop lights behind the camera / beyond fShadowDistance (no visible shadow)
@@ -27,14 +27,9 @@ namespace vsm
 		                                   // budgeted re-bakes (only the dirty light's block re-renders), instead of P2's whole-cache rebuild
 		bool  translucentShadows = false;  // A5 module (default OFF): colored translucent shadows — glass/alpha casters dim + tint the
 		                                   // light passing through (transmittance atlas at t112), instead of being excluded entirely
-		bool  cullEmptyLightPasses = false;  // O4 perf (default OFF): skip a light's entire 6-face caster pass when NO caster (static,
-		                                     // dynamic, or skinned) lies within its radius — CPU sphere-vs-radius pre-check. UNTESTED.
-		bool  alphaTestedShadows   = false;  // A6 (default OFF): alpha-TESTED cutouts (foliage/grates/chain/hair) sample their diffuse
-		                                     // alpha + clip() in the depth pass so they cast punched-through SILHOUETTES, not solid quads.
-		                                     // Fail-safe: any caster we can't fully wire (no diffuse SRV / no UV) falls back to a solid quad.
-		bool  spatialCasterIndex   = false;  // O10 perf (default OFF): bin casters into a world-space uniform grid so each light's
-		                                     // 6-face cull queries only NEARBY casters -> render cull O(#lights) instead of O(lights x
-		                                     // casters). Draw set is identical to the brute-force scan (harness-verified); UNTESTED in-game.
+		// O4 (cull-empty-light-passes), A6 (alpha-tested cutout silhouettes) and O10 (world-space spatial caster
+		// index) used to be opt-in toggles. They are strictly-better / output-identical, so they are now ALWAYS ON
+		// with no config gate — no way to turn a normal feature off. Behaviour is bisectable via git, not a flag.
 
 		// [classification] — per-shape shadow-caster overrides matched against the caster's model NIF path
 		// (substring, e.g. '\effects\') and shape name (WHOLE-TOKEN, so 'marker' hits 'EditorMarker' but not

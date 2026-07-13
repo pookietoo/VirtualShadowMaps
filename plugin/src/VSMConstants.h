@@ -54,6 +54,13 @@ namespace vsm
 	inline constexpr std::uint32_t kRebuildInterval    = 30;    // frames between scene-graph re-traversals
 	inline constexpr std::uint64_t kSlotEvictFrames    = 90;    // free a light's persistent atlas slot after this many frames unseen (LRU)
 	inline constexpr float         kLightMoveEps       = 0.5f;  // world-units a collected light must move to invalidate the P2 static cache
+	// Moving-light shadow smoothing (aesthetics). Swinging lanterns/torches update their position in
+	// discrete Havok/animation steps; rendering each step faithfully reads as jerky. We low-pass the
+	// cube CENTER we generate + sample from toward the light's true position so the shadow glides.
+	// Beauty over accuracy: the shadow lags the light slightly; the bright hotspot (driven by the game's
+	// own light position, not smoothed) has soft falloff that hides the tiny desync.
+	inline constexpr float         kLightSmoothAlpha    = 0.30f;  // per-frame lerp toward the true position (~tuned @60fps). 1 = off/snap; lower = smoother + more lag.
+	inline constexpr float         kLightSmoothSnapDist = 160.0f; // world-units: a per-frame jump larger than this is a TELEPORT (cell load / reposition) -> snap, don't glide across the room.
 	inline constexpr std::uint64_t kLightGraceFrames   = 30;    // keep a light shadowed this many frames after it last appeared (anti-flicker debounce)
 	inline constexpr int           kMaxRebakesPerFrame = 2;     // P4: max MOVED lights whose static cache re-bakes per frame (new lights bypass this) — amortizes re-bake cost
 	inline constexpr float         kTranslucentCoverage = 0.5f; // A5: default per-glass opacity when the material alpha can't be read (0 = clear .. 1 = opaque tint)

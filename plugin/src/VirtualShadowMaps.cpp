@@ -91,9 +91,9 @@ float4 main(float4 pos : SV_Position) : SV_Target { return float4(Transmittance.
 
 	// A6: alpha-TESTED cutout depth pass. VS passes the caster's UV through; PS samples the diffuse alpha and
 	// clip()s below the material threshold so foliage / grates / chain / hair cast their punched-through
-	// SILHOUETTE instead of a solid quad. Still writes CasterId to the id atlas (like kIdPS). Off unless
-	// alphaTestedShadows is on AND the caster was fully wired (diffuse SRV + a UV attribute); else it renders
-	// via the solid kDepthVS/kIdPS path (fail-safe).
+	// SILHOUETTE instead of a solid quad. Still writes CasterId to the id atlas (like kIdPS). Used whenever the
+	// caster was fully wired (diffuse SRV + a UV attribute); else it renders via the solid kDepthVS/kIdPS path
+	// (fail-safe). Always on — no config gate.
 	constexpr char kAlphaVS[] = R"(
 cbuffer PerDrawCB : register(b0) { row_major float4x4 WorldViewProj; uint CasterId; float AlphaThreshold; uint2 _pad; float4 Transmittance; };
 struct VOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -478,6 +478,19 @@ void VirtualShadowMaps::SetupResources()
 	cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 	cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 	device->CreateBuffer(&cbDesc, nullptr, &perDrawCB);
+
+	// P1a: a D3D11.1 context lets us offset-bind sub-ranges of one big cbuffer (VSSetConstantBuffers1), so the
+	// solid caster draws can share a single pre-filled buffer instead of Map-ing per draw. Requires the
+	// ConstantBufferOffsetting feature (to bind 16-constant windows) — without it, we drop context1 and keep the
+	// per-draw Map path. Null context1 => immediate path everywhere (drawBatchActive stays false).
+	if (context && SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context1)))) {
+		D3D11_FEATURE_DATA_D3D11_OPTIONS opts{};
+		if (FAILED(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opts, sizeof(opts))) ||
+		    !opts.ConstantBufferOffsetting || !opts.ConstantBufferPartialUpdate) {
+			context1.Reset();  // can't offset-bind cbuffer windows -> fall back to the immediate per-draw path
+			logger::info("VSM P1a: constant-buffer offsetting unsupported; using the per-draw cbuffer path");
+		}
+	}
 
 	// compile the embedded depth VS -> shader + input layouts
 	ComPtr<ID3DBlob> vsBlob, err;
@@ -989,8 +1002,25 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 		const uint32_t idx    = static_cast<uint32_t>(lightRecords.size());
 		// Per-light cube-face resolution from the on-screen size metric (variable resolution, ladder rung).
 		const int faceRes = AssignFaceRes(radius, p, camPos, static_cast<const void*>(bl));
+		// Aesthetics (Q2): smooth the cube CENTER for moving lights so stepped Havok/animation motion
+		// (swinging lanterns/torches) glides instead of jerking. New lights + teleports SNAP; small
+		// per-frame steps glide toward the true position. Feeds BOTH positionWS (what the shader samples)
+		// and BuildCubeMatrices (what we generate) so generation and sampling stay consistent.
+		DirectX::XMFLOAT3 sp = { p.x, p.y, p.z };
+		{
+			const auto sit = smoothLightById.find(static_cast<const void*>(bl));
+			if (sit != smoothLightById.end()) {
+				const DirectX::XMFLOAT3& q = sit->second;
+				const float d = std::sqrt((p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y) + (p.z - q.z) * (p.z - q.z));
+				if (d <= vsm::kLightSmoothSnapDist) {  // small step -> glide; big jump (teleport) -> snap (keep sp = raw p)
+					const float a = lightSmoothAlpha;
+					sp = { q.x + (p.x - q.x) * a, q.y + (p.y - q.y) * a, q.z + (p.z - q.z) * a };
+				}
+			}
+			smoothLightById[static_cast<const void*>(bl)] = sp;
+		}
 		LightRecord r;
-		r.positionWS = { p.x, p.y, p.z, static_cast<float>(faceRes) };  // w = this light's chosen faceRes rung
+		r.positionWS = { sp.x, sp.y, sp.z, static_cast<float>(faceRes) };  // w = this light's chosen faceRes rung
 		// far = the light's own radius: the shader's illumination cutoff is exactly d==radius
 		// (intensityFactor==1 => continue), so no shadow can exist past it. Not a tunable — a fact.
 		r.farPlane   = (std::max)(radius, 1.0f);
@@ -998,7 +1028,7 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 		// (reverse-Z tolerates a small near plane). See VSMConstants.h.
 		r.nearPlane  = (std::max)(r.farPlane * vsm::kNearPlaneFraction, vsm::kNearPlaneEpsilon);
 		// atlasX/atlasY (this block's pixel origin) are assigned by PackAtlas once every light's rung is known.
-		BuildCubeMatrices(XMVectorSet(p.x, p.y, p.z, 1.0f), r.nearPlane, r.farPlane, faceRes, r.cubeVP);
+		BuildCubeMatrices(XMVectorSet(sp.x, sp.y, sp.z, 1.0f), r.nearPlane, r.farPlane, faceRes, r.cubeVP);
 		lightRecords.push_back(r);
 		lightNames.push_back(niLight->name.c_str() ? niLight->name.c_str() : "");  // identify the camera light in the dump
 		lightOwnerRef.push_back(niLight->GetUserData() ? niLight->GetUserData()->GetFormID() : 0);  // for the ref cull
@@ -1096,6 +1126,13 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 	prevLightById.clear();
 	for (size_t i = 0; i < lightRecords.size(); ++i)
 		prevLightById[lightPtrs[i]] = { lightRecords[i].positionWS.x, lightRecords[i].positionWS.y, lightRecords[i].positionWS.z };
+	// Prune smoothed-position state for lights that vanished this frame (mirror prevLightById's lifetime),
+	// so a light that returns far away later SNAPS via the teleport guard rather than gliding from a stale pos.
+	if (!smoothLightById.empty()) {
+		const std::unordered_set<const void*> seen(lightPtrs.begin(), lightPtrs.end());
+		for (auto it = smoothLightById.begin(); it != smoothLightById.end();)
+			it = seen.count(it->first) ? std::next(it) : smoothLightById.erase(it);
+	}
 	// P2: a collected light MOVED (mv > eps) or a NEW light appeared (mv == -1) -> the cached static depth,
 	// baked in each light's cube space, is stale. Invalidate so RenderDepth re-bakes. Rare when standing still
 	// (Skyrim lights are mostly static + the light set is stable), so caching holds there.
@@ -1174,8 +1211,28 @@ void VirtualShadowMaps::UploadLightBuffer()
 		if (n < cap)
 			std::memset(static_cast<uint8_t*>(m.pData) + n * sizeof(LightRecord), 0,
 			    (cap - n) * sizeof(LightRecord));
+		// LLF light-index alignment (Option c): publish BSLight* -> t111 slot ATOMICALLY with this upload, so the
+		// map always describes exactly the buffer LLF binds (LLF consumes both one frame later — the render tick is
+		// the Present hook, LLF's Prepass reads the previous Present's output; see docs/ARCHITECTURE §6.1). Only the
+		// n uploaded slots are mapped; everything else resolves to kNoShadowIndex (LLF renders it unshadowed).
+		lightIndexByPtr.clear();
+		lightIndexByPtr.reserve(n);
+		for (size_t i = 0; i < n; ++i)
+			if (i < lightPtrs.size() && lightPtrs[i])
+				lightIndexByPtr.emplace(lightPtrs[i], static_cast<std::uint32_t>(i));
 		context->Unmap(lightBuffer.Get(), 0);
 	}
+}
+
+// LLF light-index alignment (Option c): BSLight* -> its ShadowLights (t111) slot, or kNoShadowIndex if this light
+// has no shadow record this frame. O(1) hash lookup. Called by LLF (VSM_GetLightShadowIndex export) while building
+// its light buffers; reads the map published by the previous frame's UploadLightBuffer (consistent with the buffer
+// LLF has bound this frame). No lock: the map is written only in UploadLightBuffer (Present tick) and read during
+// the next frame's LLF passes, which do not overlap.
+std::uint32_t VirtualShadowMaps::GetLightShadowIndex(const void* a_bsLight) const
+{
+	const auto it = lightIndexByPtr.find(a_bsLight);
+	return it != lightIndexByPtr.end() ? it->second : kNoShadowIndex;
 }
 
 // Mirror the live tuning sliders into the shader's b13 cbuffer. Field order/types are fixed by
@@ -1600,9 +1657,9 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::
 			e.twoSided     = twoSided;
 			e.ownerRef     = a_owner;
 			e.isStatic     = IsCasterStatic(tri, a_owner);       // R5: cache-safe worldspace statics
-			// A6: alpha-TESTED cutout (foliage/grate/chain) — capture the diffuse SRV + threshold + UV offset so the
-			// depth pass clip()s the silhouette. Any missing piece leaves alphaTested=false -> renders as a solid quad.
-			if (vsm::GetConfig().alphaTestedShadows && geoRt.alphaProperty && geoRt.alphaProperty->GetAlphaTesting() &&
+			// A6 (always on): alpha-TESTED cutout (foliage/grate/chain) — capture the diffuse SRV + threshold + UV
+			// offset so the depth pass clip()s the silhouette. Any missing piece leaves alphaTested=false -> solid quad.
+			if (geoRt.alphaProperty && geoRt.alphaProperty->GetAlphaTesting() &&
 			    !geoRt.alphaProperty->GetAlphaBlending() && rd->vertexDesc.HasFlag(RE::BSGraphics::Vertex::VF_UV)) {
 				const std::uint32_t uvOff = rd->vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_TEXCOORD0);
 				ID3D11ShaderResourceView* diffSrv = nullptr;
@@ -1923,11 +1980,10 @@ void VirtualShadowMaps::BuildCasterBounds()
 		    std::sqrt(hx * hx + hy * hy + hz * hz) };
 	}
 
-	// O10: (re)build the world-space caster grid from the fresh spheres, or drop it if the toggle is off.
-	if (vsm::GetConfig().spatialCasterIndex)
-		BuildCasterGrid();
-	else
-		casterGrid.clear();
+	// O10 (always on): (re)build the world-space caster grid from the fresh spheres so each light's cube cull
+	// queries only nearby casters (render cull O(#lights), not O(lights x casters)). Draw set is identical to the
+	// exhaustive scan (harness-verified) — a strictly-better optimization, so there is no way to turn it off.
+	BuildCasterGrid();
 }
 
 // O10 tuning. The query half-extent is ADDITIVE (1.02*farPlane + kCasterGridRadiusK*maxCasterRadius), not a flat
@@ -2100,6 +2156,7 @@ void VirtualShadowMaps::ForEachLightFace(const LightRecord& a_light,
 		const D3D11_VIEWPORT vp{ static_cast<float>(blockX + col * lfr), static_cast<float>(blockY + row * lfr),
 			static_cast<float>(lfr), static_cast<float>(lfr), 0.0f, 1.0f };
 		context->RSSetViewports(1, &vp);
+		curFaceViewport = vp;  // P1a: a deferred (batched) draw restores this face's viewport at submit time
 		XMFLOAT4 planes[6];
 		ExtractFrustumPlanes(a_light.cubeVP[f], planes);
 		a_body(XMLoadFloat4x4(&a_light.cubeVP[f]), planes);
@@ -2168,14 +2225,34 @@ void VirtualShadowMaps::DrawStaticCaster(size_t i, DirectX::FXMMATRIX faceVP, co
 	if (cs.w >= 0.0f && !SphereInFrustum(planes, RE::NiPoint3{ cs.x, cs.y, cs.z }, cs.w))
 		return;
 
-	// Two-sided casters draw with CULL_NONE so their away-facing side still writes depth.
-	context->RSSetState(registry[i].twoSided ? rasterStateNoCull.Get() : rasterState.Get());
-
-	// A6: alpha-tested cutout? Switch to the UV/clip pipeline for THIS draw, then restore the solid one. Every
-	// prerequisite is re-checked (toggle, wired caster, valid SRV/shaders/layout) — any miss keeps the solid path.
+	// A6: alpha-tested cutout? It needs a per-draw pipeline switch (UV/clip shaders + diffuse SRV), so it can't
+	// batch — those stay on the immediate path. Every prerequisite is re-checked; any miss keeps the solid path.
 	ID3D11InputLayout* alphaLayout = nullptr;
-	const bool useAlpha = vsm::GetConfig().alphaTestedShadows && registry[i].alphaTested && registry[i].diffuseSRV &&
+	const bool useAlpha = registry[i].alphaTested && registry[i].diffuseSRV &&
 	                      alphaVS && alphaPS && (alphaLayout = GetAlphaLayout(registry[i].uvUVOffset)) != nullptr;
+
+	const DirectX::XMMATRIX wvp = XMMatrixMultiply(NiTransformToXM(geom->world), faceVP);
+
+	// P1a: SOLID caster -> defer into the batch (one shared cbuffer, offset-bound at submit). Depth-only draws are
+	// order-independent, so this is output-identical. Raster state (twoSided) + viewport are recorded per entry.
+	if (drawBatchActive && !useAlpha) {
+		BatchedDraw& bd = drawBatch.emplace_back();
+		bd.vb         = reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer);
+		bd.ib         = reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer);
+		bd.indexCount = registry[i].indexCount;
+		bd.stride     = registry[i].vertexStride;
+		bd.twoSided   = registry[i].twoSided;
+		bd.vp         = curFaceViewport;
+		XMStoreFloat4x4(&bd.wvp, wvp);
+		bd.casterId       = static_cast<std::uint32_t>(i) + 1u;
+		bd.alphaThreshold = registry[i].alphaThreshold;
+		++visibleCasters;
+		return;
+	}
+
+	// Immediate path (alpha-tested casters, or no D3D11.1 context). Two-sided casters draw with CULL_NONE so their
+	// away-facing side still writes depth.
+	context->RSSetState(registry[i].twoSided ? rasterStateNoCull.Get() : rasterState.Get());
 	if (useAlpha) {
 		context->VSSetShader(alphaVS.Get(), nullptr, 0);
 		context->PSSetShader(alphaPS.Get(), nullptr, 0);
@@ -2186,7 +2263,7 @@ void VirtualShadowMaps::DrawStaticCaster(size_t i, DirectX::FXMMATRIX faceVP, co
 		context->PSSetSamplers(0, 1, alphaSampler.GetAddressOf());
 	}
 	EmitCasterDraw(i, reinterpret_cast<ID3D11Buffer*>(rd->vertexBuffer), reinterpret_cast<ID3D11Buffer*>(rd->indexBuffer),
-	    XMMatrixMultiply(NiTransformToXM(geom->world), faceVP), XMFLOAT4{ 1.0f, 1.0f, 1.0f, 1.0f });  // opaque: transmittance unused
+	    wvp, XMFLOAT4{ 1.0f, 1.0f, 1.0f, 1.0f });  // opaque: transmittance unused
 	if (useAlpha) {  // restore the solid pipeline for the next caster
 		context->VSSetShader(depthVS.Get(), nullptr, 0);
 		context->PSSetShader(idPS.Get(), nullptr, 0);
@@ -2195,6 +2272,74 @@ void VirtualShadowMaps::DrawStaticCaster(size_t i, DirectX::FXMMATRIX faceVP, co
 		context->PSSetShaderResources(0, 1, &nullSRV);
 	}
 	++visibleCasters;
+}
+
+// P1a: flush every deferred solid caster draw. Fill ONE dynamic cbuffer (one Map) with all per-draw constants at
+// 256-byte slots, then submit each draw binding just its 16-constant window via VSSetConstantBuffers1 — replacing
+// the per-draw Map(perDrawCB). The solid pipeline (depthVS + idPS/null PS + ilFull) is already bound by the caller;
+// we only restore each entry's viewport + raster state (deduped) before its draw. Depth-only => order-independent.
+void VirtualShadowMaps::SubmitDrawBatch()
+{
+	if (drawBatch.empty() || !context1)
+		return;
+
+	// Grow the slot buffer to fit this frame's draw count (round up to reduce reallocation churn).
+	const UINT need = static_cast<UINT>(drawBatch.size());
+	if (perDrawCBArrayCount < need) {
+		const UINT cap = (need + 255u) & ~255u;  // round up to a multiple of 256 slots
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth      = cap * kPerDrawSlotBytes;
+		bd.Usage          = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		perDrawCBArray.Reset();
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &perDrawCBArray))) {
+			perDrawCBArrayCount = 0;
+			return;  // allocation failed -> skip the batch this frame (solids simply don't draw; recovers next frame)
+		}
+		perDrawCBArrayCount = cap;
+	}
+
+	// One Map: write every draw's PerDrawCB into its 256-byte slot.
+	D3D11_MAPPED_SUBRESOURCE m{};
+	if (FAILED(context1->Map(perDrawCBArray.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+		return;
+	auto* base = static_cast<std::uint8_t*>(m.pData);
+	for (size_t k = 0; k < drawBatch.size(); ++k) {
+		auto* pd = reinterpret_cast<PerDrawCB*>(base + k * kPerDrawSlotBytes);
+		pd->WorldViewProj  = drawBatch[k].wvp;
+		pd->CasterId       = drawBatch[k].casterId;
+		pd->AlphaThreshold = drawBatch[k].alphaThreshold;
+		pd->Transmittance  = { 1.0f, 1.0f, 1.0f, 1.0f };  // solid opaque: unused by depth/id shaders
+	}
+	context1->Unmap(perDrawCBArray.Get(), 0);
+
+	// Submit. Dedup viewport + raster-state changes; bind each draw's 16-constant window to VS (and PS, for the id
+	// atlas on dump frames). curVp starts invalid so the first entry always sets its viewport.
+	ID3D11Buffer* arr = perDrawCBArray.Get();
+	const UINT zeroOffset = 0;
+	D3D11_VIEWPORT curVp{ -1, -1, -1, -1, -1, -1 };
+	int curTwoSided = -1;  // -1 = unset -> first draw sets raster state
+	for (size_t k = 0; k < drawBatch.size(); ++k) {
+		const BatchedDraw& d = drawBatch[k];
+		if (d.vp.TopLeftX != curVp.TopLeftX || d.vp.TopLeftY != curVp.TopLeftY ||
+		    d.vp.Width != curVp.Width || d.vp.Height != curVp.Height) {
+			context->RSSetViewports(1, &d.vp);
+			curVp = d.vp;
+		}
+		if (static_cast<int>(d.twoSided) != curTwoSided) {
+			context->RSSetState(d.twoSided ? rasterStateNoCull.Get() : rasterState.Get());
+			curTwoSided = static_cast<int>(d.twoSided);
+		}
+		const UINT first = static_cast<UINT>(k) * kPerDrawSlotConstants;  // 16-constant units
+		const UINT num   = kPerDrawSlotConstants;
+		context1->VSSetConstantBuffers1(0, 1, &arr, &first, &num);
+		context1->PSSetConstantBuffers1(0, 1, &arr, &first, &num);  // idPS reads CasterId (b0) on dump frames
+		context->IASetVertexBuffers(0, 1, &d.vb, &d.stride, &zeroOffset);
+		context->IASetIndexBuffer(d.ib, DXGI_FORMAT_R16_UINT, 0);
+		context->DrawIndexed(d.indexCount, 0, 0);
+	}
+	drawBatch.clear();
 }
 
 // One skinned range into the current cube face. Extracted verbatim from RenderDepth's face loop; the
@@ -2228,16 +2373,17 @@ void VirtualShadowMaps::DrawSkinnedRange(const SkinnedRange& r, DirectX::FXMMATR
 void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 {
 	const bool blinkOff = (flashCaster >= 0) && (((frameIndex / kFlashHalfPeriodFrames) % 2u) == 1u);
-	// O4 (config.cullEmptyLightPasses, default OFF): skip a light's whole 6-face pass when NO caster this pass
-	// would draw lies within the light's radius — a CPU sphere-vs-radius pre-check over exactly what the pass
-	// draws (opaque buffer casters matching the filter via casterWorldSphere; skinned ranges when a_drawSkinned).
-	// Conservative: culls only when provably empty; the default-off toggle keeps the baseline untouched.
-	const bool cullEmpty = vsm::GetConfig().cullEmptyLightPasses;
-	// O10: when spatialCasterIndex is on and a grid was built, each light iterates only NEARBY casters (the grid
-	// query) instead of the whole registry. `cand == nullptr` means "iterate all of registry" — the exact prior
-	// behavior — so the default-off path is byte-for-byte unchanged. The candidate set is a conservative superset,
-	// so DrawStaticCaster's own per-face SphereInFrustum refine still yields the identical drawn set.
-	const bool useGrid = vsm::GetConfig().spatialCasterIndex && !casterGrid.cells.empty();
+	// P1a: defer SOLID caster draws into drawBatch this pass, submitted in one batch below (when a D3D11.1 context
+	// is available). Skinned/glass/alpha draws stay immediate and interleave harmlessly (depth is order-independent).
+	drawBatchActive = (context1 != nullptr);
+	drawBatch.clear();
+	// O4 (always on): skip a light's whole 6-face pass when NO caster this pass would draw lies within the light's
+	// radius — a CPU sphere-vs-radius pre-check over exactly what the pass draws (opaque buffer casters matching the
+	// filter via casterWorldSphere; skinned ranges when a_drawSkinned). Conservative: culls only when provably empty.
+	// O10 (always on): each light iterates only NEARBY casters via the world-space grid (cand) instead of the whole
+	// registry. `cand == nullptr` means "iterate all of registry" (fallback when the grid is empty). The candidate
+	// set is a conservative superset, so DrawStaticCaster's per-face SphereInFrustum refine yields the identical set.
+	const bool useGrid = !casterGrid.cells.empty();
 	for (const auto& light : lightRecords) {
 		const std::vector<std::uint32_t>* cand = nullptr;
 		if (useGrid) {
@@ -2249,7 +2395,7 @@ void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 			if (cand) { for (std::uint32_t i : *cand) body(static_cast<size_t>(i)); }
 			else      { for (size_t i = 0; i < registry.size(); ++i) body(i); }
 		};
-		if (cullEmpty) {
+		{  // O4 (always on): skip this light's whole 6-face pass if no caster it would draw is within radius
 			const float lx = light.positionWS.x, ly = light.positionWS.y, lz = light.positionWS.z;
 			const float lr = light.farPlane;  // far plane == light radius
 			bool any = false;
@@ -2278,6 +2424,8 @@ void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 				DrawStaticCaster(i, faceVP, planes, blinkOff);
 			});
 			// --- Path B: skinned characters (world-absolute posed buffer -> same cube VP, world=identity) ---
+			// These stay IMMEDIATE and run here with b0 still bound to perDrawCB (the batch rebinds b0 only in the
+			// flush below, AFTER this whole light loop) — so the skinned Map(perDrawCB) draws are unaffected.
 			if (a_drawSkinned && skinnedVB && skinnedIB && !skinnedRanges.empty()) {
 				ID3D11Buffer* svb = skinnedVB.Get();
 				UINT sstride = static_cast<UINT>(sizeof(XMFLOAT3)), soff = 0;
@@ -2287,6 +2435,11 @@ void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 					DrawSkinnedRange(r, faceVP, planes, blinkOff);
 			}
 		});
+	}
+	// P1a: flush the deferred solid casters (one cbuffer fill + offset-bound submit). No-op if batching is off.
+	if (drawBatchActive) {
+		SubmitDrawBatch();
+		drawBatchActive = false;
 	}
 }
 
@@ -2584,15 +2737,22 @@ void VirtualShadowMaps::RenderFrame()
 
 void VirtualShadowMaps::DrawMenu()
 {
-	// Drawn inside the Community Shaders menu via the CS add-on hook (shared ImGui context).
+	// Drawn in the Community Shaders feature list under the "Lighting" category via the CS
+	// add-on hook (shared ImGui context) — invoked only while our entry is selected.
 	menuVisible = true;
 
+#if !VSM_DIAGNOSTICS
+	// Deployment build: VSM runs automatically; there are no user-facing settings here
+	// (any advanced overrides live in VirtualShadowMaps.toml). Attribution only.
+	ImGui::SeparatorText("Virtual Shadow Maps");
+	ImGui::TextDisabled("Made by PookieToo");
+#else
 	if (!ImGui::CollapsingHeader("Virtual Shadow Maps", ImGuiTreeNodeFlags_DefaultOpen)) {
 		showDebug = false;  // panel collapsed -> no debug work
 		return;
 	}
 
-	settingsDirty |= ImGui::Checkbox("Enabled##VSM", &enabled);  // deploy menu shows ONLY this + the quality slider
+	settingsDirty |= ImGui::Checkbox("Enabled##VSM", &enabled);  // dev-only on/off for A/B testing (deploy is hardwired ON)
 	ImGui::SetNextItemWidth(140.0f);
 	settingsDirty |= ImGui::SliderFloat("Shadow quality (k)##VSM", &vsm::GetConfig().qualityFactor, 0.25f, 4.0f, "%.2f");
 	ImGui::SameLine(); ImGui::TextDisabled("texels/pixel; higher = sharper + more VRAM");
@@ -2664,6 +2824,12 @@ void VirtualShadowMaps::DrawMenu()
 	// ---- Live shadow tuning: updates the shader immediately via the b13 cbuffer, no rebuild ----
 	ImGui::Separator();
 	ImGui::Text("Shadow tuning (live)");
+
+	// Moving-light smoothing (aesthetics): de-steps swinging lanterns/torches. 1 = off (snap to the
+	// light each frame); lower = smoother glide with more lag. Deploy uses vsm::kLightSmoothAlpha.
+	ImGui::SetNextItemWidth(140.0f);
+	ImGui::SliderFloat("Moving-light smoothing##VSM", &lightSmoothAlpha, 0.05f, 1.0f, "alpha %.2f");
+	ImGui::SameLine(); ImGui::TextDisabled("1 = snap (off); lower = smoother swinging shadows (more lag)");
 
 	// Dimension A: which world-space we PROJECT/MATCH in. The atlas is absolute, so absP is the
 	// fix; 1/2 are controls. Re-tests every mode below without a rebuild.
@@ -2781,4 +2947,5 @@ void VirtualShadowMaps::DrawMenu()
 		ImGui::Image((ImTextureID)previewSRV.Get(), ImVec2(rtAtlasW * previewScale, rtAtlasH * previewScale));
 	}
 #endif  // VSM_DIAGNOSTICS
+#endif  // !VSM_DIAGNOSTICS
 }

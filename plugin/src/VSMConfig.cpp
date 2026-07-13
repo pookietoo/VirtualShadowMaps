@@ -60,16 +60,8 @@ namespace
 		    "# Colored translucent shadows: glass / alpha-blended casters dim and tint the light passing through\n"
 		    "# them (instead of being excluded). Adds a transmittance atlas. Default false (module under validation).\n"
 		    "translucentShadows = {}\n"
-		    "# Performance (O4, default false): skip a light's entire 6-face caster pass when NO caster lies within its\n"
-		    "# radius (CPU sphere-vs-radius pre-check). Off-by-default optimization, UNTESTED in-game.\n"
-		    "cullEmptyLightPasses = {}\n"
-		    "# Alpha-tested cutout shadows (A6, default false): foliage / grates / chain / hair sample their diffuse alpha\n"
-		    "# and clip() in the depth pass, casting punched-through silhouettes instead of solid quads. Fail-safe.\n"
-		    "alphaTestedShadows = {}\n"
-		    "# Performance (O10, default false): bin shadow casters into a world-space uniform grid so each light's cube-face\n"
-		    "# cull only tests NEARBY casters -> render cull scales with light count, not lights x total casters. The drawn\n"
-		    "# shadow set is identical to the exhaustive scan (verified in the offline harness). UNTESTED in-game.\n"
-		    "spatialCasterIndex = {}\n"
+		    "# NOTE: cull-empty-light-passes (O4), alpha-tested cutout silhouettes (A6) and the world-space spatial\n"
+		    "# caster index (O10) are no longer toggles — they are strictly-better / output-identical and now ALWAYS ON.\n"
 		    "\n"
 		    "# Per-shape shadow-caster overrides. Match the caster's model NIF path (as a substring — use path\n"
 		    "# fragments like '\\effects\\', '\\magic\\', '\\lod\\') and/or its shape name (WHOLE-TOKEN: a name is\n"
@@ -96,9 +88,6 @@ namespace
 		    c.cullCasters,
 		    c.incrementalCache,
 		    c.translucentShadows,
-		    c.cullEmptyLightPasses,
-		    c.alphaTestedShadows,
-		    c.spatialCasterIndex,
 		    ToTomlArray(c.forceCast),
 		    ToTomlArray(c.forceNoCast),
 		    vsm::kFaceRes, vsm::kMaxLights);
@@ -130,15 +119,17 @@ namespace vsm
 			return;
 		}
 
+#if VSM_DIAGNOSTICS
+		// Dev build only: allow the .toml (and the in-menu toggle) to turn VSM off for testing.
+		// Deployment has no off switch by design — it stays hardwired ON; uninstall to disable.
 		enabled       = tbl["general"]["enabled"].value_or(enabled);
+#endif
 		qualityFactor      = tbl["general"]["qualityFactor"].value_or(qualityFactor);
 		cacheStaticShadows = tbl["general"]["cacheStaticShadows"].value_or(cacheStaticShadows);
 		cullCasters        = tbl["general"]["cullCasters"].value_or(cullCasters);
 		incrementalCache   = tbl["general"]["incrementalCache"].value_or(incrementalCache);
 		translucentShadows = tbl["general"]["translucentShadows"].value_or(translucentShadows);
-		cullEmptyLightPasses = tbl["general"]["cullEmptyLightPasses"].value_or(cullEmptyLightPasses);
-		alphaTestedShadows   = tbl["general"]["alphaTestedShadows"].value_or(alphaTestedShadows);
-		spatialCasterIndex   = tbl["general"]["spatialCasterIndex"].value_or(spatialCasterIndex);
+		// O4/A6/O10 are always-on now (no toggle) — any legacy keys in an old .toml are simply ignored.
 
 		// [classification] pattern lists (arrays of strings). Absent section => leave empty (no override).
 		forceCast.clear();

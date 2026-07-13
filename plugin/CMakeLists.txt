@@ -75,6 +75,9 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${VSM_MOD_DIR}/Shaders/LightLimitFix" "${VSM_MOD_DIR}/Shaders/VirtualShadowMaps"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VSM_SHADER_SRC}/Lighting.hlsl" "${VSM_MOD_DIR}/Shaders/Lighting.hlsl"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VSM_SHADER_SRC}/LightLimitFix/LightLimitFix.hlsli" "${VSM_MOD_DIR}/Shaders/LightLimitFix/LightLimitFix.hlsli"
+    # Common.hlsli carries the VSM light-index field (Light.vsmShadowIndex, P4) — shipped as an OVERRIDE so a stock
+    # CS package + this dist/ is a complete install (see notes/CS_INTEGRATION_MANIFEST.md). Keep in sync with the C++ LightData.
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VSM_SHADER_SRC}/LightLimitFix/Common.hlsli" "${VSM_MOD_DIR}/Shaders/LightLimitFix/Common.hlsli"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VSM_SHADER_SRC}/VirtualShadowMaps/VSM.hlsli" "${VSM_MOD_DIR}/Shaders/VirtualShadowMaps/VSM.hlsli"
     VERBATIM
     COMMENT "Deploying VirtualShadowMaps.dll + shaders (copy-if-different) -> dist/Virtual Shadow Maps/")

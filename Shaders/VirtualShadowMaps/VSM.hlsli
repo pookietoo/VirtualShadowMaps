@@ -176,7 +176,10 @@ namespace VSM
 	// pixelPos = SV_Position.xy (screen pixels), used only to select the probe target pixel.
 	// Restructured to a single exit so the armed probe can capture the FULL state (incl. the reason
 	// a pixel came back lit) — the returned shadow value is identical to the original branch logic.
-	float GetLocalShadow(float3 lightPosWS, float3 P, float2 pixelPos, float3 worldNormal, out float3 transmittance)
+	// LLF path: vsmIndex = this light's slot in ShadowLights, stamped by LLF into Light.vsmShadowIndex (a shared
+	// BSLight* key; see docs/ARCHITECTURE §6.1 + notes/CS_INTEGRATION_MANIFEST.md). O(1) — no per-pixel search. A
+	// position-argmin overload (non-LLF fallback) is defined below and delegates here.
+	float GetLocalShadow(uint vsmIndex, float3 P, float2 pixelPos, float3 worldNormal, out float3 transmittance)
 	{
 		transmittance = float3(1.0, 1.0, 1.0);  // A5: default clear (white) — set from the transmittance atlas once a light is matched
 		// Probe targets the centre pixel; the probe centre is supplied by C++ as gProbePixelX/Y (already in
@@ -190,8 +193,8 @@ namespace VSM
 		}
 
 		float3 W        = SampleP(P);                                   // pixel in projection space (glued to atlas)
-		float3 matchEye = (gMatchEye == 1) ? float3(gAltEyeX, gAltEyeY, gAltEyeZ) : FrameBuffer::CameraPosAdjust.xyz;
-		float3 absLight = lightPosWS + matchEye;                        // match key (absolute)
+		float3 matchEye = (gMatchEye == 1) ? float3(gAltEyeX, gAltEyeY, gAltEyeZ) : FrameBuffer::CameraPosAdjust.xyz;  // probe only now
+		float3 matchedLightPos = float3(0, 0, 0);                       // matched light's world pos (for the diagnostic probe)
 
 		int    matched = -1, face = -1, reason = 0, inb = 0, front = 0;
 		float  clipW = 0.0, occluder = 0.0, linPix = 0.0, linOcc = 0.0;  // reverse-Z: 0.0 = far = empty/no-occluder
@@ -202,24 +205,20 @@ namespace VSM
 		if (gMode != 0 && gMode != 23 && gMode != 24 && gMode != 25) {
 			reason = 1;                                                // pure-overlay debug mode -> lit
 		} else {
-			// NEAREST-light identity match. The correct light sits at distance ~0 from absLight (it IS that
-			// light, reconstructed); every other light is its real world-separation away. So argmin is exact
-			// and threshold-FREE. This replaces the old FIRST-within-gMatchThresh loop, which let a
-			// lower-indexed light steal a pixel when two lights fell within the threshold -> wrong cube ->
-			// arbitrary occluder -> spurious cross-room shadow. gMatchThresh is no longer needed.
-			int best = -1; float bestD = kArgMinInit;
-			uint lightCount, lightStride; ShadowLights.GetDimensions(lightCount, lightStride);  // runtime buffer size (grows with active lights; NO cap)
-			[loop] for (uint i = 0; i < lightCount; ++i) {
-				float3 rp = ShadowLights[i].positionWS.xyz;
-				if (dot(rp, rp) < kEmptySlotMin) continue;
-				float dl = distance(rp, absLight);
-				if (dl < bestD) { bestD = dl; best = (int)i; }
-			}
-			if (best < 0) {
-				reason = 2;                                            // no shadow light present -> lit
+			// >>> VSM PATCH (light-index alignment) — re-merge: notes/CS_INTEGRATION_MANIFEST.md P6
+			// O(1) DIRECT INDEX. LLF stamped this light's ShadowLights slot into Light.vsmShadowIndex and passes it
+			// in (Lighting.hlsl). Replaces the old O(lights²)/pixel nearest-position argmin over ALL ShadowLights —
+			// the dominant per-pixel sampling cost (proven by testing/gpu/sample_main.cpp). FAIL-SAFE: a sentinel
+			// (0xFFFFFFFF) or any out-of-range index reads a ZEROED record (D3D robust structured-buffer access), so
+			// it collapses into the SAME empty-slot test the argmin used -> 'lit', never a wrong cube. The non-LLF
+			// fallback overload below resolves the index by argmin (compiled only when LIGHT_LIMIT_FIX is off).
+			LightRecord L = ShadowLights[vsmIndex];                    // sentinel / OOB -> zeroed record -> caught as empty
+			if (dot(L.positionWS.xyz, L.positionWS.xyz) < kEmptySlotMin) {
+				reason = 2;                                            // no VSM shadow for this light -> lit
 			} else {
-				matched       = best;
-				LightRecord L = ShadowLights[best];
+				matched        = (int)vsmIndex;
+				matchedLightPos = L.positionWS.xyz;                    // for the probe
+			// <<< VSM PATCH
 				// A3 NORMAL-OFFSET BIAS: shift the receiver along its surface normal toward the light by a fraction
 				// of the shadow texel's world footprint, scaled up at grazing angles (where acne + peter-panning
 				// live). A shifted receiver samples the atlas depth in FRONT of its own surface, escaping texel
@@ -234,22 +233,35 @@ namespace VSM
 				float  footA3 = dLA3 * (2.0 / L.positionWS.w);                 // shadow texel world size at this receiver distance
 				float3 Woff   = W + nrmA3 * (footA3 * saturate(1.0 - ndlA3) * kNormalOffsetK);
 				face          = FaceFromDir(Woff - L.positionWS.xyz);
-				float4 clip   = mul(float4(Woff, 1.0), L.cubeVP[face]);
-				clipW         = clip.w;
-				if (clip.w <= kDivEps) {
-					reason = 3;                                        // behind the light -> lit
+				// >>> VSM PATCH (cube-direct) — face UV + compare depth DIRECTLY from the direction, NO cubeVP matrix
+				// (no 4x4 multiply, no 64-byte matrix read, no ndc divide) -> ~-52% per-pixel sampling. Per-face LH
+				// look-to axes matching BuildCubeMatrices (world-Z up for X/Y faces, world-Y up for +/-Z) + guard-band
+				// scale (faceRes-2)/faceRes; linPix = axial distance. VALIDATED bit-equivalent to the old matrix path
+				// (tools/cube_direct_check.py: 100% face, 99.89% UV, 99.81% verdict over 43,697 receivers). The two
+				// range checks below (far, then near) replace the old behind/out-of-cube checks; FaceFromDir already
+				// guarantees the point is within its face, so no ndc.xy bounds test is needed.
+				float3 dcd  = Woff - L.positionWS.xyz;
+				float3 acd  = abs(dcd);
+				float  macd, xvcd, yvcd;
+				if (acd.x >= acd.y && acd.x >= acd.z) { macd = acd.x; xvcd = (dcd.x >= 0.0 ? dcd.y : -dcd.y); yvcd = dcd.z; }
+				else if (acd.y >= acd.z)              { macd = acd.y; xvcd = (dcd.y >= 0.0 ? -dcd.x : dcd.x); yvcd = dcd.z; }
+				else                                  { macd = acd.z; xvcd = (dcd.z >= 0.0 ? dcd.x : -dcd.x); yvcd = dcd.y; }
+				clipW = macd;                                          // (probe) = axial distance to the light
+				if (macd > L.farPlane) {
+					reason = 3;                                        // beyond the light's far -> lit
 				} else {
 					front = 1;
-					ndc   = clip.xyz / clip.w;
-					if (ndc.x < -1 || ndc.x > 1 || ndc.y < -1 || ndc.y > 1 || ndc.z < 0 || ndc.z > 1) {
-						reason = 4;                                    // out of this light's cube -> lit
+					if (macd < L.nearPlane) {
+						reason = 4;                                    // nearer than the light's near plane -> lit
 					} else {
 						inb = 1;
 						// RUNTIME atlas dims (from the b13 cbuffer) so sampling matches the texture the plugin
 						// actually allocated this frame (sized for the active lights, at iShadowMapResolution).
 						float faceRes = L.positionWS.w;  // per-light cube-face resolution (was global gFaceRes)
-						float2 faceUV = ndc.xy * float2(0.5, -0.5) + 0.5;
-						faceUV = clamp(faceUV, 0.5 / faceRes, 1.0 - 0.5 / faceRes);  // never floor into a neighbour tile
+						float  scd    = (faceRes - 2.0) / faceRes;             // guard-band FOV scale (matches BuildCubeMatrices)
+						float2 faceUV = float2((xvcd / macd) * scd * 0.5 + 0.5, -(yvcd / macd) * scd * 0.5 + 0.5);  // direction -> face UV, NO matrix
+						faceUV        = clamp(faceUV, 0.5 / faceRes, 1.0 - 0.5 / faceRes);  // never floor into a neighbour tile
+						ndc           = float3(faceUV * 2.0 - 1.0, saturate(macd / L.farPlane));  // (probe only; the compare uses linPix)
 						float2 tile   = float2(face % 3, face / 3);
 						float2 pxc    = float2(L.atlasX, L.atlasY) + (tile + faceUV) * faceRes;  // atlasX/Y = block pixel origin
 						atlasUV       = pxc / float2(gAtlasW, gAtlasH);
@@ -263,7 +275,7 @@ namespace VSM
 						if (gCompareMode == 1) {
 							shadow = (occluder - ndc.z > 0.0) ? 0.0 : 1.0;   // raw compare (isolates linearize); reverse-Z: occluder nearer (larger z) than receiver = shadowed
 						} else {
-							linPix = LinearizeCubeDepth(ndc.z,    L.nearPlane, L.farPlane);
+							linPix = macd;   // cube-direct: axial distance IS the compare depth (no linearize-of-ndc.z)
 							linOcc = LinearizeCubeDepth(occluder, L.nearPlane, L.farPlane);
 							// CALCULATED receiver-plane bias — replaces the gBiasWorld magic slider AND the dead
 							// rasterizer DepthBias (=~0.19u on a D32_FLOAT atlas, useless). A receiver's distance
@@ -321,8 +333,8 @@ namespace VSM
 			pr.P          = float4(P, 0.0);
 			pr.camAdjust  = float4(FrameBuffer::CameraPosAdjust.xyz, 0.0);
 			pr.W          = float4(W, (float)gSampleSpace);
-			pr.lightPosWS = float4(lightPosWS, 0.0);
-			pr.absLight   = float4(absLight, 0.0);
+			pr.lightPosWS = float4(matchedLightPos, 0.0);              // VSM PATCH: was the lightPosWS param; now the matched light's pos
+			pr.absLight   = float4(matchedLightPos + matchEye, 0.0);   // VSM PATCH: match key reconstructed from the matched light
 			pr.matched    = float4((float)matched, (float)face, (float)inb, (float)front);
 			pr.ndc        = float4(ndc, clipW);
 			pr.uv_occ     = float4(atlasUV, occluder, (float)reason);
@@ -333,6 +345,26 @@ namespace VSM
 		// Tint modes 23/24/25 don't darken — they leave the scene lit and Lighting.hlsl paints the hit
 		// pixels (see ShadowTint). Every other non-zero mode returns 1 (DebugColor paints the overlay).
 		return (gMode == 23 || gMode == 24 || gMode == 25) ? 1.0 : shadow;
+	}
+
+	// NON-LLF FALLBACK overload (position-argmin -> index, then delegate). Community Shaders with Light Limit Fix
+	// (the shipping config) always calls the uint-index overload above; this float3 overload is compiled ONLY for
+	// the !LIGHT_LIMIT_FIX permutation of Lighting.hlsl (the PointLightPosition path), where no LLF Light struct —
+	// and thus no stamped vsmShadowIndex — exists. It reconstructs the index by the same nearest-position argmin the
+	// index path replaced (O(lights) per call, only on that degenerate path), so behavior there is unchanged.
+	float GetLocalShadow(float3 lightPosWS, float3 P, float2 pixelPos, float3 worldNormal, out float3 transmittance)
+	{
+		float3 matchEye = (gMatchEye == 1) ? float3(gAltEyeX, gAltEyeY, gAltEyeZ) : FrameBuffer::CameraPosAdjust.xyz;
+		float3 absLight = lightPosWS + matchEye;                       // match key (absolute)
+		int  best = -1; float bestD = kArgMinInit;
+		uint lightCount, lightStride; ShadowLights.GetDimensions(lightCount, lightStride);
+		[loop] for (uint i = 0; i < lightCount; ++i) {
+			float3 rp = ShadowLights[i].positionWS.xyz;
+			if (dot(rp, rp) < kEmptySlotMin) continue;
+			float dl = distance(rp, absLight);
+			if (dl < bestD) { bestD = dl; best = (int)i; }
+		}
+		return GetLocalShadow(best < 0 ? 0xFFFFFFFFu : (uint)best, P, pixelPos, worldNormal, transmittance);
 	}
 
 	// When true, Lighting.hlsl replaces the pixel color with DebugColor() so we can visualize any

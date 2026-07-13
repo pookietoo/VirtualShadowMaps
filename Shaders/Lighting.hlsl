@@ -2771,7 +2771,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * light.fade;
 		float lightShadow = 1.0;
 		float3 vsmTransmittance;  // A5 colored translucent shadows (glass tint/dim); white when the module is off
-		lightShadow *= VSM::GetLocalShadow(light.positionWS.xyz, input.WorldPosition.xyz, input.Position.xy, worldNormal, vsmTransmittance);
+		lightShadow *= VSM::GetLocalShadow(light.vsmShadowIndex, input.WorldPosition.xyz, input.Position.xy, worldNormal, vsmTransmittance);  // VSM PATCH (light-index alignment): pass the O(1) index LLF stamped, not the position — manifest P5
 		lightColor *= vsmTransmittance;
 
 		// VSM: engine's 4-slot local shadow mask stays bypassed; only OUR atlas shadows local

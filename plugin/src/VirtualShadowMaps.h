@@ -22,6 +22,7 @@
 
 #include <DirectXMath.h>
 #include <d3d11.h>
+#include <d3d11_1.h>   // ID3D11DeviceContext1 for P1a batched-draw offset-bound cbuffer submit
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -56,6 +57,13 @@ public:
 	ID3D11Buffer*             GetDebugCB() const { return debugCB.Get(); }
 	int  GetShadowLightCount() const { return static_cast<int>(lightRecords.size()); }
 	bool IsEnabled() const { return enabled; }
+	// LLF light-index alignment (Option c): map a BSLight* to its slot in the ShadowLights (t111) buffer, so
+	// LLF's Lighting.hlsl can index our shadow record directly instead of an O(lights²)/pixel position search.
+	// Returns kNoShadowIndex when this light has no shadow record this frame (LLF renders it unshadowed — the
+	// fail-safe). The map is (re)built atomically with UploadLightBuffer, so it always describes the buffer LLF
+	// binds (both consumed one frame later; see docs/ARCHITECTURE §6.1). See [[llf-light-index-coupling]].
+	static constexpr std::uint32_t kNoShadowIndex = 0xFFFFFFFFu;
+	std::uint32_t GetLightShadowIndex(const void* a_bsLight) const;
 
 	// Real-shader pixel probe: our OMSetRenderTargets hook (Plugin.cpp) binds this UAV at u8 during
 	// the lighting draws ONLY while armed, so the real Lighting.hlsl can write its per-pixel state.
@@ -126,7 +134,7 @@ private:
 		                                                     // opaque depth atlas. Skipped by every depth pass.
 		float                         transR = 1.0f, transG = 1.0f, transB = 1.0f;  // A5 per-channel transmittance
 		                                                     // (1 = clear) = 1 - coverage*(1 - materialTint); what fraction of each light channel passes
-		// A6 alpha-tested cutout: when alphaTested AND alphaTestedShadows is on, the depth pass samples diffuseSRV's
+		// A6 alpha-tested cutout (always on): when alphaTested, the depth pass samples diffuseSRV's
 		// alpha at the vertex UV (byte offset uvUVOffset, R16G16_FLOAT) and clip()s below alphaThreshold -> silhouette.
 		// diffuseSRV is a RAW pointer OWNED BY THE GAME (valid while `geom` is alive, which we hold via NiPointer);
 		// null / not-alphaTested -> the caster renders as a solid quad (fail-safe).
@@ -236,7 +244,7 @@ private:
 	void PoseFreezeLight(size_t a_i, const BakedPose& a_bp);  // restore one held light's cube VPs + pos from its baked snapshot (keeps faceRes)
 	ComPtr<ID3D11VertexShader>       depthVS;
 	ComPtr<ID3D11InputLayout>        ilFull;    // POSITION R32G32B32_FLOAT (always; see RebuildRegistry)
-	// A6 alpha-tested cutout depth pass (opt-in, alphaTestedShadows). VS passes UV, PS clips on diffuse alpha.
+	// A6 alpha-tested cutout depth pass (always on). VS passes UV, PS clips on diffuse alpha.
 	ComPtr<ID3D11VertexShader>       alphaVS;
 	ComPtr<ID3D11PixelShader>        alphaPS;
 	ComPtr<ID3D11SamplerState>       alphaSampler;   // wrap+linear for the diffuse alpha sample
@@ -253,6 +261,34 @@ private:
 	ComPtr<ID3D11RasterizerState>    rasterState;
 	ComPtr<ID3D11RasterizerState>    rasterStateNoCull;  // CULL_NONE for two-sided casters (both faces cast)
 	ComPtr<ID3D11Buffer>             perDrawCB;
+
+	// --- P1a batched draw submit (always on when the hardware exposes an ID3D11DeviceContext1) -----------
+	// Every SOLID opaque caster draw used to Map(perDrawCB, WRITE_DISCARD) its own 96-byte cbuffer (1556x/frame
+	// in the 7-light test scene). Instead we DEFER those draws into drawBatch, fill ONE large cbuffer in a single
+	// Map, then submit each draw with a D3D11.1 offset-bound 16-constant window (VSSetConstantBuffers1). Depth-only
+	// rendering is order-independent, so deferring is output-identical; skinned / glass / alpha-tested casters keep
+	// the immediate path. Falls back to the per-draw Map path when context1 is null (no D3D11.1).
+	static constexpr UINT kPerDrawSlotConstants = 16;                 // 16 float4 constants = 256 B; the VSSetConstantBuffers1 alignment unit
+	static constexpr UINT kPerDrawSlotBytes     = kPerDrawSlotConstants * 16;  // 256 B per slot (PerDrawCB is 96 B; rest is pad)
+	struct BatchedDraw
+	{
+		ID3D11Buffer*      vb = nullptr;   // caster vertex buffer (owned by the game; valid this frame)
+		ID3D11Buffer*      ib = nullptr;   // caster index buffer
+		UINT               indexCount = 0;
+		UINT               stride = 0;
+		bool               twoSided = false;
+		D3D11_VIEWPORT     vp{};           // the atlas face viewport this draw targets (restored at submit)
+		DirectX::XMFLOAT4X4 wvp{};         // world * cube-face view-proj
+		std::uint32_t      casterId = 0;   // registry index + 1 (id atlas)
+		float              alphaThreshold = 0.0f;
+	};
+	ComPtr<ID3D11DeviceContext1> context1;              // QI'd from context; null => immediate per-draw path
+	ComPtr<ID3D11Buffer>         perDrawCBArray;         // large dynamic cbuffer of kPerDrawSlotBytes slots (grown on demand)
+	UINT                         perDrawCBArrayCount = 0;// slot capacity of perDrawCBArray
+	std::vector<BatchedDraw>     drawBatch;              // deferred solid opaque draws for the current RenderCasterPass
+	bool                         drawBatchActive = false;// true while RenderCasterPass defers solids into drawBatch
+	D3D11_VIEWPORT               curFaceViewport{};      // set by ForEachLightFace; captured into each batched draw
+	void SubmitDrawBatch();      // flush drawBatch: one cbuffer fill + offset-bound submit of every deferred draw
 
 	// linear-depth debug view (fullscreen resolve of depthTex -> grayscale)
 	ComPtr<ID3D11Texture2D>          previewTex;
@@ -350,13 +386,13 @@ private:
 	// with the draw (absolute world via geom->world), so no worldBound.center anywhere in RenderDepth's cull.
 	void BuildCasterBounds();
 
-	// --- O10 (config.spatialCasterIndex, default OFF): world-space uniform caster grid ---------------------
+	// --- O10 (always on): world-space uniform caster grid -------------------------------------------------
 	// Each light's 6-face cull would otherwise plane-test EVERY caster (O(lights x casters)); the harness
 	// measured that at 3.48 s/frame at scale. Binning caster spheres into a coarse world grid lets a light
 	// query only the cells its bounding cube overlaps -> O(#lights x local density). Built each frame from
-	// casterWorldSphere in BuildCasterBounds (only when the toggle is on); queried per light in
-	// RenderCasterPass. The candidate set is a conservative SUPERSET, so the per-face SphereInFrustum refine
-	// then yields the IDENTICAL drawn shadow set as the exhaustive scan (verified offline in testing/).
+	// casterWorldSphere in BuildCasterBounds; queried per light in RenderCasterPass. The candidate set is a
+	// conservative SUPERSET, so the per-face SphereInFrustum refine then yields the IDENTICAL drawn shadow set
+	// as the exhaustive scan (verified offline in testing/) — strictly better, so there is no config gate.
 	struct CasterGrid
 	{
 		float cell      = 512.0f;   // world units per cell (~median light radius; a coarse bucket, not tight)
@@ -370,7 +406,7 @@ private:
 			return (u(x) << 42) | (u(y) << 21) | u(z);
 		}
 	};
-	CasterGrid                    casterGrid;             // rebuilt each frame when spatialCasterIndex is on
+	CasterGrid                    casterGrid;             // rebuilt each frame (O10 always on)
 	std::vector<std::uint32_t>    casterQueryScratch;     // reused per-light candidate list (no per-light alloc)
 	std::vector<std::uint32_t>    casterQuerySeen;        // stamp-dedup, parallel to registry
 	std::uint32_t                 casterQueryStamp = 0;   // bumped per query; seen[i]==stamp => already a candidate
@@ -488,7 +524,12 @@ private:
 	// camera reports its true per-frame delta — nearest-neighbour matching hid that (it snapped to a
 	// static neighbour). Compared against cameraMovedThisFrame to spot a shadow that rides the camera.
 	std::vector<const void*>       lightPtrs;      // parallel to lightRecords: the BSLight* identity
+	// LLF light-index alignment (Option c): BSLight* -> its slot in ShadowLights (t111). Rebuilt in
+	// UploadLightBuffer (atomic with the GPU upload) from lightPtrs. Read via GetLightShadowIndex by LLF.
+	std::unordered_map<const void*, std::uint32_t> lightIndexByPtr;
 	std::unordered_map<const void*, DirectX::XMFLOAT3> prevLightById;  // BSLight* -> last-frame world pos
+	std::unordered_map<const void*, DirectX::XMFLOAT3> smoothLightById;  // BSLight* -> SMOOTHED cube center (aesthetics: de-step swinging lights; see vsm::kLightSmoothAlpha)
+	float lightSmoothAlpha = vsm::kLightSmoothAlpha;  // live moving-light smoothing strength (DEV slider tunes it; deploy = the constant)
 	std::unordered_map<const void*, int>               prevLightFaceRes;  // BSLight* -> last-frame chosen face rung (hysteresis)
 	// STABLE atlas allocation (P1, performance): a light keeps the SAME atlas slot across frames so P2 can
 	// cache its static depth. Slots are allocated on a light's first appearance, reused while its resolution
