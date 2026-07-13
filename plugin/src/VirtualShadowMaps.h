@@ -1,24 +1,20 @@
 #pragma once
 
 // ============================================================================
-// VirtualShadowMaps — standalone SKSE plugin, owned entirely by us.
+// VirtualShadowMaps — a standalone SKSE plugin.
 //
-// Each frame (driven by an IDXGISwapChain::Present hook) it renders our OWN cube-shadow
+// Each frame (driven by an IDXGISwapChain::Present hook) it renders a cube-shadow
 // atlas for every active local light — statics from a persistent scene-graph registry,
 // plus CPU-skinned characters (Path B) — and exposes the atlas + per-light buffer to
 // Community Shaders' LightLimitFix, whose Lighting.hlsl samples them (VSM.hlsli) so local
-// lights the engine's shadow budget dropped still cast shadows.
+// lights beyond the engine's shadow budget still cast shadows.
 //
-// The settings UI (DrawMenu) draws INTO the Community Shaders menu via CS's add-on hook
-// (CS_RegisterExternalMenu / CS_GetImGui) — our logic never lives in CS's DLL; CS only
-// exposes a tiny generic hook, and our DLL shares CS's ImGui context.
+// The settings UI (DrawMenu) draws into the Community Shaders menu via CS's add-on hook
+// (CS_RegisterExternalMenu / CS_GetImGui); the plugin's logic never lives in CS's DLL, and
+// the DLL shares CS's ImGui context.
 // ============================================================================
 
-#include "VSMBuildConfig.h"  // VSM_DIAGNOSTICS dev/deploy toggle + VSM_LOG macro
 #include "VSMConstants.h"  // vsm:: atlas geometry + capacities (single source of truth)
-#if VSM_DIAGNOSTICS
-	#include "VirtualShadowMaps_Diagnostics.h"  // VsmDiagnostics — the extracted diagnostics apparatus (diag member below)
-#endif
 
 #include <DirectXMath.h>
 #include <d3d11.h>
@@ -68,10 +64,6 @@ public:
 	// Real-shader pixel probe: our OMSetRenderTargets hook (Plugin.cpp) binds this UAV at u8 during
 	// the lighting draws ONLY while armed, so the real Lighting.hlsl can write its per-pixel state.
 	// (u8 because Lighting.hlsl's pixel shader already outputs render targets at u0..u7.)
-#if VSM_DIAGNOSTICS
-	ID3D11UnorderedAccessView* GetPixelProbeUAV() const { return pixelProbeUAV.Get(); }
-	bool IsProbeArmed() const { return probeArmed; }
-#endif
 
 	// Called from VSM_GetShadowResources each time CS pulls our resources to bind — lets the dump
 	// verify the CS<->plugin handshake is live (fetch happening on the current frame).
@@ -79,14 +71,6 @@ public:
 
 private:
 	VirtualShadowMaps() = default;
-
-	// The diagnostics apparatus (dumps / probes / census / preview) lives in its own class,
-	// off this god-object. It reaches our private render-state through m_core, so it's a friend;
-	// we own it by value and hand it a reference to ourselves. See VirtualShadowMaps_Diagnostics.*.
-#if VSM_DIAGNOSTICS
-	friend class VsmDiagnostics;
-	VsmDiagnostics diag{ *this };
-#endif
 
 	void SetupResources();
 	void CollectLights(RE::ShadowSceneNode* a_ssn);    // gather all active local lights -> lightRecords
@@ -124,7 +108,7 @@ private:
 		                                                     // CULL_NONE so the away-face still casts (else a plane
 		                                                     // facing away from the light casts no atlas shadow)
 		RE::FormID                    ownerRef     = 0;      // the TESObjectREFR this mesh belongs to. A shadow
-		                                                     // light's OWN housing (fire-pit rim/flame plane) shares
+		                                                     // light's housing (fire-pit rim/flame plane) shares
 		                                                     // the light's ref -> skip it (see RenderDepth ref cull).
 		bool                          isStatic     = false;  // R5 classification: STATIC = never moves (base Static/
 		                                                     // StaticCollection, not skinned, no anim controller) ->
@@ -352,8 +336,8 @@ private:
 	int rejectedDecal = 0;
 	// Billboard geometry (under a NiBillboardNode): camera-facing effect planes (smoke/vapor/fire/glow).
 	// They (1) always turn to face the player, so any hard shadow they cast RIDES THE CAMERA, and (2) are
-	// translucent effects that should not throw a solid shadow. This was the moving 'Plane03' vapor-smoke
-	// bar — opaque-material + CastShadows=on, so no material flag caught it; being a billboard is what does.
+	// translucent effects that should not throw a solid shadow. An opaque-material billboard with
+	// CastShadows=on carries no material flag to catch it; being a billboard is the reliable disqualifier.
 	int rejectedBillboard = 0;
 	// [classification] config overrides: shapes the user's forceNoCast patterns rejected, and shapes the
 	// forceCast patterns forced in past every built-in exclusion. Both 0 unless the user set patterns.
@@ -378,7 +362,7 @@ private:
 
 	// Per-caster bounding sphere for the FRUSTUM cull, parallel to `registry` (xyz = center, w = radius;
 	// w < 0 = no sphere -> don't cull). Derived from GetFreshWorldAABB = the SAME geom->world transform
-	// RenderDepth draws with, so the cull sphere is provably in the DRAW's absolute space and can never
+	// RenderDepth draws with, so the cull sphere is in the DRAW's absolute space and can never
 	// drift from the drawn geometry the way the engine's worldBound.center can (it went stale for skinned).
 	std::vector<DirectX::XMFLOAT4>              casterWorldSphere;
 
@@ -444,8 +428,8 @@ private:
 	// NOTE: casters are NEVER offset by cameraPos. geom->world.translate under the ShadowSceneNode is ALREADY
 	// game-absolute (confirmed vs CS: LightLimitFix passes niLight->world.translate as the absolute light pos
 	// and SUBTRACTS the eye to get camera-relative positionWS), and skinned verts are posed to absolute world.
-	// The light cubes + shader sampling are absolute too, so no-offset geometry aligns exactly. A former
-	// 'add cameraPos' toggle assumed camera-relative geometry — wrong, it shifted casters ~1300u off — removed.
+	// The light cubes + shader sampling are absolute too, so no-offset geometry aligns exactly. Adding
+	// cameraPos would assume camera-relative geometry and shift casters (~1300u) out of place.
 
 	// Reliable render eye = ShadowSceneNode::cameraPos (set each frame in CollectLights). Offset the
 	// atlas by THIS, NOT RendererShadowState::posAdjust.getEye() — the latter intermittently returns
@@ -457,8 +441,8 @@ private:
 	float probeFracX = 0.5f, probeFracY = 0.5f;
 
 	// Render-target size (from the swapchain), used to aim the pixel probe at the screen centre.
-	// DynamicResolutionParams2 turned out to be a scale (1,1) here, not 1/size, so we feed the target
-	// pixel from C++ instead of deriving it in the shader.
+	// DynamicResolutionParams2 is a scale (1,1) here, not 1/size, so the target pixel is fed from
+	// C++ instead of derived in the shader.
 	float screenW = 1920.0f, screenH = 1080.0f;
 
 	// debug view — RenderFrame does the debug-only GPU work (preview resolve, AABB scan,
@@ -469,11 +453,10 @@ private:
 
 	// debug-view controls
 	int   lightSelect   = -1;     // -1 = nearest local light to camera; else index into active lights
-	// (previewRange moved to VsmDiagnostics — read only by ResolvePreview + the menu preview slider)
 	int   isolateCaster = -1;     // -1 = render all; else 0-based registry index (matches flashCaster)
 	// Flash selector: -1 = off; else registry index whose shadow BLINKS (we skip drawing it into the
 	// atlas every other ~1/3 s so its shadow winks on/off in the world). Lets the user cycle casters
-	// until the WRONG shadow blinks, then read its name — identifies the culprit without a crosshair.
+	// until the WRONG shadow blinks, then read its name to identify the offending caster.
 	int   flashCaster = -1;
 
 	// Per-light near/far are CALCULATED from the light's own radius (CollectLights): far = radius,
@@ -491,7 +474,7 @@ private:
 	// The shader light passed to GetLocalShadow (LLF's positionWS) is camera-relative to
 	// posAdjust.getEye() (== altEye), NOT to FrameBuffer::CameraPosAdjust. If those two eyes
 	// differ, matching the shader light to our absolute buffer with CameraPosAdjust drifts with
-	// the camera. Default to altEye (the provably-correct eye); toggle back to compare.
+	// the camera. Default to altEye (the correct eye); toggle back to compare.
 	// Match with the shader's OWN same-frame FrameBuffer::CameraPosAdjust (0), exactly as LLF builds
 	// light.positionWS. Using our altEye (1) is 1 frame stale in the shader's b13 cbuffer, so on fast
 	// camera motion the stale match key can miss the nearest-light match and the shadow blinks off
@@ -505,11 +488,6 @@ private:
 	// (Former GPU compute-shader shadow-math probe removed — superseded by the real-shader pixel probe below + tools/shadow_truth.py.)
 
 	// Real-shader pixel probe (u8): written by VSM.hlsli for the centre pixel when armed.
-#if VSM_DIAGNOSTICS
-	ComPtr<ID3D11Buffer>              pixelProbeBuf;
-	ComPtr<ID3D11UnorderedAccessView> pixelProbeUAV;
-	ComPtr<ID3D11Buffer>              pixelProbeStaging;
-#endif
 
 	// diagnostics (shown in the menu to sanity-check world-space coordinates)
 	int               activeLightCount = 0;    // valid local lights this frame (shadow-casters, after filtering)
@@ -561,7 +539,6 @@ private:
 	float             dbgLightDist     = 0.0f;  // camera -> chosen light distance
 	DirectX::XMFLOAT3 dbgEye{};        // picked light world position
 	DirectX::XMFLOAT3 dbgCam{};        // camera world position
-	// (dbgCasterMin/dbgCasterMax moved to VsmDiagnostics — written by ComputeCasterBounds, read by the menu)
 
 	// vertex/index readback of one caster (triggered by a menu button)
 	bool              dbgDumpRequested = false;
@@ -572,8 +549,6 @@ private:
 	// (the menu pauses input, so an immediate dump always reads zero camera movement).
 	int               dumpDelaySeconds  = 5;      // menu slider: how long to wait before the delayed dump
 	int               dumpCountdownFrames = 0;    // >0 -> counting down to a delayed dump (fires at 0)
-	// (dbgHaveDump/dbgStride/dbgIndexCount/dbgFullPrec/dbgV/dbgIdx moved to VsmDiagnostics —
-	//  written by InspectCaster, read by the menu's "Inspect caster (raw bytes)" panel)
 
 	bool resourcesReady = false;
 	bool haveTestLight  = false;

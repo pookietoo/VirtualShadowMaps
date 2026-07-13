@@ -242,8 +242,6 @@ void VirtualShadowMaps::PersistSettingsIfChanged()
 		return;
 	auto& cfg = vsm::GetConfig();
 	cfg.enabled = enabled;
-	VSM_LOG("VSM modules: enabled={} cacheStaticShadows={} incrementalCache={} cullCasters={} translucentShadows={} qualityFactor={:.2f}",
-	    cfg.enabled, cfg.cacheStaticShadows, cfg.incrementalCache, cfg.cullCasters, cfg.translucentShadows, cfg.qualityFactor);
 	cfg.Save();
 	settingsDirty = false;
 }
@@ -273,8 +271,6 @@ void VirtualShadowMaps::ComputeAtlasDims()
 		if (auto* s = col->GetSetting("iBlurDeferredShadowMask:Display")) rtPCFRadius      = std::clamp(s->data.i, 0, vsm::kMaxPCFRadius);
 		if (auto* s = col->GetSetting("fShadowDistance:Display"))         rtShadowDistance = s->data.f;
 	}
-	VSM_LOG("VSM: iShadowMapResolution={} -> face ladder floor {} .. max {}; fShadowBiasScale={:.2f} iBlurDeferredShadowMask->PCF={} fShadowDistance={:.0f}",
-	    ini, rtFloorFaceRes, rtMaxFaceRes, rtBiasScale, rtPCFRadius, rtShadowDistance);
 }
 
 // (Re)create the per-light structured buffer + SRV at `cap` elements. Called once at setup and by
@@ -316,9 +312,6 @@ void VirtualShadowMaps::EnsureLightBuffer(int nLights)
 	while (cap < nLights) cap *= 2;
 	if (!CreateLightBufferResources(cap))
 		logger::error("VSM: light buffer grow to {} for {} lights FAILED", cap, nLights);
-	else
-		VSM_LOG("VSM: light buffer grown to {} elements (~{}KB) for {} active shadow lights", cap,
-		    (static_cast<std::int64_t>(cap) * static_cast<std::int64_t>(sizeof(LightRecord))) / 1024, nLights);
 }
 
 // (Re)create the atlas + id-atlas textures and their views at rtAtlasW x rtAtlasH. Called by SetupResources
@@ -398,7 +391,7 @@ bool VirtualShadowMaps::CreateAtlasResources()
 
 // O9 (lazy transmittance): create the A5 RGBA8 transmittance atlas at the current atlas size, only if it doesn't
 // already exist. Called from CreateAtlasResources when translucentShadows is on, and on-demand when A5 is toggled
-// on at runtime (so the shader never samples an unbound t112 — the 0.9.87 black-lights regression). Idempotent.
+// on at runtime (so the shader never samples an unbound t112, which would sample black and zero the local lights). Idempotent.
 void VirtualShadowMaps::EnsureTransmittanceAtlas()
 {
 	if (transTex || !device || rtAtlasW <= 0 || rtAtlasH <= 0)
@@ -566,7 +559,7 @@ void VirtualShadowMaps::SetupResources()
 	device->CreateRasterizerState(&rasterDesc, &rasterState);
 	// Same state but no back-face culling, bound for two-sided casters (planes, foliage cards) so their
 	// away-facing side still writes depth — otherwise a two-sided plane pointing away from the light casts
-	// no atlas shadow even though the geometry occludes (confirmed missing: Plane03 at the hearth).
+	// no atlas shadow even though the geometry occludes.
 	rasterDesc.CullMode = D3D11_CULL_NONE;
 	device->CreateRasterizerState(&rasterDesc, &rasterStateNoCull);
 
@@ -653,37 +646,10 @@ void VirtualShadowMaps::SetupResources()
 	dcb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 	device->CreateBuffer(&dcb, nullptr, &debugCB);
 
-#if VSM_DIAGNOSTICS
-	// ---- Real-shader pixel probe (u8): 1-element structured buffer the game's Lighting.hlsl writes,
-	// bound by our OMSetRenderTargets hook only while armed; plus a staging copy for readback. ----
-	{
-		D3D11_BUFFER_DESC pb{};
-		pb.ByteWidth = sizeof(PixelProbe);
-		pb.Usage = D3D11_USAGE_DEFAULT;
-		pb.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-		pb.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-		pb.StructureByteStride = sizeof(PixelProbe);
-		if (SUCCEEDED(device->CreateBuffer(&pb, nullptr, &pixelProbeBuf))) {
-			D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-			ud.Format = DXGI_FORMAT_UNKNOWN;
-			ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-			ud.Buffer.NumElements = 1;
-			device->CreateUnorderedAccessView(pixelProbeBuf.Get(), &ud, &pixelProbeUAV);
-		}
-		D3D11_BUFFER_DESC ps{};
-		ps.ByteWidth = sizeof(PixelProbe);
-		ps.Usage = D3D11_USAGE_STAGING;
-		ps.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-		ps.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-		ps.StructureByteStride = sizeof(PixelProbe);
-		device->CreateBuffer(&ps, nullptr, &pixelProbeStaging);
-	}
-#endif
 
 	registry.reserve(kRegistryReserve);  // avoid per-frame reallocation churn
 
 	resourcesReady = true;
-	VSM_LOG("VSM: resources ready ({}x{} shadow atlas + linear preview)", rtAtlasW, rtAtlasH);
 }
 
 // Snap a desired face resolution UP to the pow2 ladder [floor .. max]. The TOP rung is the EXACT max (the
@@ -791,9 +757,6 @@ void VirtualShadowMaps::PackAtlas()
 		rtAtlasH = (needH > rtAtlasH) ? needH : rtAtlasH;
 		if (!CreateAtlasResources())
 			logger::error("VSM: atlas grow to {}x{} FAILED (out of VRAM?)", rtAtlasW, rtAtlasH);
-		else
-			VSM_LOG("VSM: atlas grown to {}x{} (~{}MB); {} stable light slots", rtAtlasW, rtAtlasH,
-			    (static_cast<std::int64_t>(rtAtlasW) * rtAtlasH * static_cast<std::int64_t>(sizeof(float))) / kBytesPerMB, lightSlots.size());
 	}
 }
 
@@ -812,7 +775,7 @@ void VirtualShadowMaps::PoseFreezeLight(size_t a_i, const BakedPose& a_bp)
 // Finalize the P2 static-cache invalidation and, if the cache HOLDS this frame, FREEZE each light's pose to
 // the snapshot the cache was baked with — so the shader samples the held atlas with the EXACT baking pose. A
 // sub-threshold light jitter (fire flicker, moveThisFrame < kLightMoveEps) would otherwise smear the cached
-// static shadow (the reported "pulsing from the fire"). Runs after PackAtlas, before UploadLightBuffer.
+// static shadow (a pulsing shadow from the fire). Runs after PackAtlas, before UploadLightBuffer.
 void VirtualShadowMaps::UpdateStaticCacheState()
 {
 	auto& cfg = vsm::GetConfig();
@@ -954,8 +917,8 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 		// and per-light variable resolution keeps it small (see notes/VSM_VARIABLE_RESOLUTION.md).
 		if (!bl || bl == rt.sunLight)
 			return true;
-		// Only genuine shadow-casters — skip ambient/fill lights (the engine's own flags). This is the
-		// fix for "shadows from nowhere": we were shadowing every illuminating light, not just casters.
+		// Only genuine shadow-casters — skip ambient/fill lights (the engine's own flags). Shadowing every
+		// illuminating light rather than just casters produces "shadows from nowhere".
 		if (bl->ambientLight) {
 			++lightsAmbient;
 			return true;
@@ -1518,8 +1481,8 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::
 	// A NiBillboardNode turns to face the camera every frame. Any geometry beneath one is a camera-facing
 	// effect plane (smoke/vapor/fire/glow); it must NOT cast a hard shadow: (1) as it re-orients each frame
 	// its shadow would RIDE THE CAMERA, and (2) it is a translucent effect. Detect it during descent and
-	// propagate to all descendants. (Opaque-material billboards like the 'Plane03' vapor-smoke have no alpha/
-	// effect/decal/no-cast flag to catch them — being a billboard is the only reliable disqualifier.)
+	// propagate to all descendants. (An opaque-material billboard has no alpha/effect/decal/no-cast flag to
+	// catch it — being a billboard is the only reliable disqualifier.)
 	const bool underBillboard = a_underBillboard || (netimmerse_cast<RE::NiBillboardNode*>(a_obj) != nullptr);
 
 	if (auto* tri = a_obj->AsTriShape()) {
@@ -1542,14 +1505,14 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::
 		    !geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kCastShadows);
 		// A DECAL is a flat texture projected onto a surface (scorch marks, blood, dirt, fire-glow
 		// pools) — no volume, never a shadow caster. Skip it. Universally correct regardless of the
-		// CastShadows bit, and the prime suspect for the flat hearth 'Plane03' bars.
+		// CastShadows bit.
 		const bool decal = geoRt.shaderProperty &&
 		    (geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kDecal) ||
 		     geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kDynamicDecal) ||
 		     geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kProjectedUV) ||   // projected-UV decal
 		     geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kWeaponBlood));     // weapon-blood overlay
 		// Two-sided material: must rasterize with CULL_NONE so the away-facing side still casts (else a
-		// plane pointing away from the light writes no atlas depth — the confirmed Plane03 missing shadow).
+		// plane pointing away from the light writes no atlas depth).
 		const bool twoSided = geoRt.shaderProperty &&
 		    geoRt.shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kTwoSided);
 		// --- Additional engine "don't cast" signals (research-derived; see notes/VSM_SHADOW_CLASSIFICATION_
@@ -1568,8 +1531,8 @@ void VirtualShadowMaps::RebuildRegistry(RE::NiAVObject* a_obj, int a_depth, RE::
 		const bool isWater = geoRt.shaderProperty &&
 		    netimmerse_cast<RE::BSWaterShaderProperty*>(geoRt.shaderProperty.get()) != nullptr;
 		// Invisible in-game via the runtime NiAVObject flag (distinct from kHidden/app-cull, skipped at the top
-		// of RebuildRegistry): the engine doesn't draw OR cast it. Prime suspect for the reported "invisible
-		// mesh casting a shadow on characters" — a mesh hidden this way but with kCastShadows still on.
+		// of RebuildRegistry): the engine doesn't draw OR cast it. Catches an invisible mesh (hidden this way
+		// but with kCastShadows still on) that would otherwise cast a shadow on characters.
 		const bool notVisible = a_obj->GetFlags().any(RE::NiAVObject::Flag::kNotVisible);
 		// Config pattern override (per-shape). Checked FIRST: forceCast beats every built-in exclusion below,
 		// forceNoCast beats casting. Free (no path lookup) unless the user set patterns.
@@ -1694,17 +1657,16 @@ namespace
 // OR BSDynamicTriShape (head/hair/face) — into pre-allocated arrays, bounds-checked. A torn-down streaming
 // partition faults here and is caught, leaving partial-but-safe results instead of a CTD.
 //
-// "Rule B" (0.9.95; supersedes 0.9.91/92/93). PROVEN by 4 independent agents via triangle EDGE-LENGTH checks:
+// Skin-buffer layout (verified via triangle edge-length checks):
 //  - The skin vertex buffer is ONE shape-GLOBAL buffer of N = sp->vertexCount unique verts; all partitions share
-//    it. `vertexMap` AND `triList` entries are GLOBAL vertex ids in [0,N) (measured triList.max()==vertexMap.max()
+//    it. `vertexMap` AND `triList` entries are GLOBAL vertex ids in [0,N) (triList.max()==vertexMap.max()
 //    and > p.vertices in every partition). The inline bone-slot bytes are DIRECT global palette indices
 //    (max slot == numMats-1), so NiSkinPartition::Partition::bones is VESTIGIAL in this layout.
 //  - Therefore: skin each GLOBAL vertex ONCE into [base, base+N), and emit each partition's triList directly
-//    against the caster's SINGLE vertex base. The old per-partition `partBase + triList[k]` treated the already-
-//    global triList as partition-local, so on partitions >=2 the triangle indices ran PAST the caster's block
-//    into the NEXT caster's verts in the shared skinPosed buffer -> the multi-partition explosion AND the player
-//    "cylinder" (a head's eye-partition landing on a neighbouring actor). Single-partition meshes were always
-//    fine because partBase==0. Vertex-RADIUS checks are blind to this (positions coherent, connectivity wrong).
+//    against the caster's SINGLE vertex base. A per-partition `partBase + triList[k]` would treat the already-
+//    global triList as partition-local, so on partitions >=2 the triangle indices run PAST the caster's block
+//    into the NEXT caster's verts in the shared skinPosed buffer. Single-partition meshes are unaffected
+//    (partBase==0). Vertex-RADIUS checks are blind to this (positions coherent, connectivity wrong).
 //  - Position source is the ONLY body/dynamic difference: dynamicData[g] (CPU-morphed model space) for a dynamic
 //    shape, else the buffer's VA_POSITION[g]. Output is WORLD-absolute (palette folds skin->world; no geom->world).
 static void VSM_SkinCaster(RE::BSGeometry* a_g, DirectX::XMFLOAT3* a_posed, std::uint32_t* a_idx,
@@ -1760,7 +1722,7 @@ static void VSM_SkinCaster(RE::BSGeometry* a_g, DirectX::XMFLOAT3* a_posed, std:
 		// referenced vertex count on some props (seen on Fish: vertexCount=54 but only 51 verts referenced), so
 		// skinning the full [0,N) would touch unreferenced entries that may be garbage — polluting the caster
 		// bounds (and risking a genuine out-of-bounds buffer read when vertexCount > the real buffer). maxRef =
-		// highest triangle index -> skin exactly [0, Nskin). (Caught by the GPU-readback oracle: Fish flew to ~2100u.)
+		// highest triangle index -> skin exactly [0, Nskin).
 		std::uint32_t maxRef = 0;
 		bool anyTri = false;
 		for (std::uint32_t pi = 0; pi < sp->numPartitions; ++pi) {
@@ -1858,7 +1820,7 @@ void VirtualShadowMaps::SkinAllCasters()
 		const std::uint32_t v0 = vCount;
 		const std::uint32_t i0 = iCount;
 
-		// One unified skin path (Rule B): VSM_SkinCaster handles BOTH the rigid BSTriShape (bind pose +
+		// One unified skin path: VSM_SkinCaster handles BOTH the rigid BSTriShape (bind pose +
 		// palette) and the BSDynamicTriShape (position from dynamicData) — they differ only in position source.
 		// For a dynamic shape the engine writes dynamicData (facegen/expression/morph) ASYNC under this spinlock;
 		// read it unlocked and we race the writer -> torn positions. So take the lock around the dynamic read.
@@ -1875,11 +1837,11 @@ void VirtualShadowMaps::SkinAllCasters()
 
 		// Posed-vertex sanity — measured SELF-REFERENTIALLY against the posed centroid, NEVER against
 		// worldBound.CENTER. That center is the geometry NODE's bound and goes STALE when the skeleton
-		// moves the mesh away from it: a displaced/ragdolled NPC posed cleanly ~261u off her own stale
-		// bound (Y only) while the male beside her matched exactly. The game draws the mesh from the SAME
-		// boneMatrices we pose from, so a COHERENT pose is valid WHEREVER its centroid lands — only a
-		// SCATTERED pose is a real skinning explosion. So reference the centroid (position, self-consistent)
-		// and the bound RADIUS (size, reliable), and never the bound CENTER (position, can be stale).
+		// moves the mesh away from it: a displaced/ragdolled NPC can pose cleanly far off its own stale
+		// bound. The game draws the mesh from the SAME boneMatrices we pose from, so a COHERENT pose is
+		// valid WHEREVER its centroid lands — only a SCATTERED pose is a real skinning explosion. So
+		// reference the centroid (position, self-consistent) and the bound RADIUS (size, reliable), and
+		// never the bound CENTER (position, can be stale).
 		double cx = 0.0, cy = 0.0, cz = 0.0;
 		const std::uint32_t n = vCount - v0;
 		for (std::uint32_t v = v0; v < vCount; ++v) {
@@ -1990,7 +1952,7 @@ void VirtualShadowMaps::BuildCasterBounds()
 // multiple of the radius: SphereInFrustum is a PLANE test, so at a cube face's far-plane corner the two 45deg-tilted
 // side planes admit a passing sphere whose CENTER sits up to ~1.414x its radius laterally beyond the true frustum.
 // A flat radius multiple drops those casters (verified: a naive 1.10x cube mismatched the exhaustive scan by ~0.2%
-// on every scenario); the additive radius term covers them and keeps the candidate set a provable superset. The
+// on every scenario); the additive radius term covers them and keeps the candidate set a conservative superset. The
 // 1.02 factor covers the ~90.45deg guard-band FOV whose own far corner sits at 1.008*farPlane per axis.
 static constexpr float kCasterGridFovGuard = 1.02f;
 static constexpr float kCasterGridRadiusK  = 2.0f;   // > 0.414 (the 1.414x lateral push minus the radius itself); generous.
@@ -2219,7 +2181,7 @@ void VirtualShadowMaps::DrawStaticCaster(size_t i, DirectX::FXMMATRIX faceVP, co
 	// Frustum-cull sphere: from casterWorldSphere (GetFreshWorldAABB = the SAME geom->world we draw
 	// with), NOT geom->worldBound.center — that is a separately-maintained value that can drift from
 	// the render transform (it went stale for skinned casters), which is the space ambiguity we're
-	// removing. This sphere is provably in the draw's absolute space.
+	// removing. This sphere is in the draw's absolute space.
 	const DirectX::XMFLOAT4& cs = (i < casterWorldSphere.size()) ? casterWorldSphere[i]
 	                                                             : DirectX::XMFLOAT4{ 0, 0, 0, -1.0f };
 	if (cs.w >= 0.0f && !SphereInFrustum(planes, RE::NiPoint3{ cs.x, cs.y, cs.z }, cs.w))
@@ -2379,7 +2341,7 @@ void VirtualShadowMaps::RenderCasterPass(int a_filter, bool a_drawSkinned)
 	drawBatch.clear();
 	// O4 (always on): skip a light's whole 6-face pass when NO caster this pass would draw lies within the light's
 	// radius — a CPU sphere-vs-radius pre-check over exactly what the pass draws (opaque buffer casters matching the
-	// filter via casterWorldSphere; skinned ranges when a_drawSkinned). Conservative: culls only when provably empty.
+	// filter via casterWorldSphere; skinned ranges when a_drawSkinned). Conservative: culls only when the pass is empty.
 	// O10 (always on): each light iterates only NEARBY casters via the world-space grid (cand) instead of the whole
 	// registry. `cand == nullptr` means "iterate all of registry" (fallback when the grid is empty). The candidate
 	// set is a conservative superset, so DrawStaticCaster's per-face SphereInFrustum refine yields the identical set.
@@ -2564,8 +2526,6 @@ void VirtualShadowMaps::RenderDepth()
 			context->OMSetRenderTargets(0, &noRtv, staticDsv.Get());
 			for (size_t idx : bakeThisFrame)
 				BakeOneLightStatic(idx);
-			VSM_LOG("VSM P4: incremental re-bake of {} light block(s); {} still dirty (budget {}/frame)",
-			    bakeThisFrame.size(), dirtyLights.size(), vsm::kMaxRebakesPerFrame);
 		}
 	} else if (!staticCacheValid) {
 		// P2 whole-cache: re-bake ALL static casters at once when the single validity bit is clear.
@@ -2585,7 +2545,6 @@ void VirtualShadowMaps::RenderDepth()
 			bp.pos = { lightRecords[i].positionWS.x, lightRecords[i].positionWS.y, lightRecords[i].positionWS.z };
 			bakedPose[(i < lightPtrs.size()) ? lightPtrs[i] : nullptr] = bp;
 		}
-		VSM_LOG("VSM P2: re-baked static cache ({} registry casters, {} lights) — cache HOLDS + pose FROZEN until a light moves/appears or the cell changes", registry.size(), lightRecords.size());
 	}
 
 	// COMPOSITE: live atlas <- cached static depth (single whole-resource copy; legal for depth). Unbind the
@@ -2677,9 +2636,6 @@ void VirtualShadowMaps::RenderFrame()
 		return;
 	}
 
-#if VSM_DIAGNOSTICS
-	const bool menuOpen = menuVisible;  // gates the debug-only GPU work below (diagnostics builds only)
-#endif
 	menuVisible = false;  // DrawMenu re-sets this next time the menu is drawn
 
 	// Delayed-dump countdown. Runs every frame (menu open or not); once it hits zero we request the
@@ -2706,9 +2662,6 @@ void VirtualShadowMaps::RenderFrame()
 	UpdateStaticCacheState();       // P2: finalize static-cache invalidation + freeze poses if the cache holds
 	EnsureLightBuffer(activeLightCount);  // grow the per-light GPU buffer to fit ALL active lights — no cap
 	BuildCasterBounds();     // per-caster frustum spheres, in the draw's absolute space
-#if VSM_DIAGNOSTICS
-	TrackCasterMotion();     // flag casters whose render origin rides the camera (camera-relative-space bug)
-#endif
 	UploadLightBuffer();     // mirror lightRecords into the GPU buffer for the LLF shader
 	UpdateDebugCB();         // push live tuning sliders (bias/near/far/mode) + runtime atlas dims to the shader
 	// Path B: skin all characters ONCE this frame into a world-absolute posed buffer (skin-once,
@@ -2716,23 +2669,6 @@ void VirtualShadowMaps::RenderFrame()
 	SkinAllCasters();        // CPU-skin engineOnly casters -> world-absolute posed buffer (consumed by RenderDepth)
 	RenderDepth();           // render every light's cube into the atlas (clears if no lights)
 
-#if VSM_DIAGNOSTICS
-	if (dbgLogRequested) {   // on-demand numeric dump (menu button) — after lights are collected
-		dbgLogRequested = false;
-		diag.DumpDiagnosticLog();
-		dumpConfirmFrames = kDumpConfirmFrames;  // ~3s of "dump written" confirmation in the menu
-	}
-
-	// Debug-only work — skipped entirely unless the Debug section is open and on screen.
-	if (showDebug && menuOpen) {
-		diag.ComputeCasterBounds();
-		if (dbgDumpRequested) {
-			dbgDumpRequested = false;
-			diag.InspectCaster();
-		}
-		diag.ResolvePreview();
-	}
-#endif
 }
 
 void VirtualShadowMaps::DrawMenu()
@@ -2741,211 +2677,8 @@ void VirtualShadowMaps::DrawMenu()
 	// add-on hook (shared ImGui context) — invoked only while our entry is selected.
 	menuVisible = true;
 
-#if !VSM_DIAGNOSTICS
 	// Deployment build: VSM runs automatically; there are no user-facing settings here
 	// (any advanced overrides live in VirtualShadowMaps.toml). Attribution only.
 	ImGui::SeparatorText("Virtual Shadow Maps");
 	ImGui::TextDisabled("Made by PookieToo");
-#else
-	if (!ImGui::CollapsingHeader("Virtual Shadow Maps", ImGuiTreeNodeFlags_DefaultOpen)) {
-		showDebug = false;  // panel collapsed -> no debug work
-		return;
-	}
-
-	settingsDirty |= ImGui::Checkbox("Enabled##VSM", &enabled);  // dev-only on/off for A/B testing (deploy is hardwired ON)
-	ImGui::SetNextItemWidth(140.0f);
-	settingsDirty |= ImGui::SliderFloat("Shadow quality (k)##VSM", &vsm::GetConfig().qualityFactor, 0.25f, 4.0f, "%.2f");
-	ImGui::SameLine(); ImGui::TextDisabled("texels/pixel; higher = sharper + more VRAM");
-	settingsDirty |= ImGui::Checkbox("Cache static shadows (P2 performance)##VSM", &vsm::GetConfig().cacheStaticShadows);
-	ImGui::SameLine(); ImGui::TextDisabled("re-render only dynamic casters each frame");
-	settingsDirty |= ImGui::Checkbox("Cull off-screen lights (P3 performance)##VSM", &vsm::GetConfig().cullCasters);
-	ImGui::SameLine(); ImGui::TextDisabled("drop lights behind camera / beyond fShadowDistance");
-	settingsDirty |= ImGui::Checkbox("Incremental cache (P4 performance)##VSM", &vsm::GetConfig().incrementalCache);
-	ImGui::SameLine(); ImGui::TextDisabled("per-light re-bake; needs 'Cache static shadows'");
-	if (ImGui::Checkbox("Translucent shadows (A5)##VSM", &vsm::GetConfig().translucentShadows)) {
-		settingsDirty = true;
-		registryDirty = true;  // capture (or drop) glass/alpha casters on the next registry rebuild
-		// O9 (lazy transmittance): the atlas is allocated on demand. Toggling A5 ON must create it now, or the
-		// shader would sample an unbound t112 this frame (the 0.9.87 black-lights regression); OFF frees the VRAM.
-		if (vsm::GetConfig().translucentShadows)
-			EnsureTransmittanceAtlas();
-		else {
-			transTex.Reset(); transRTV.Reset(); transSRV.Reset();
-		}
-	}
-	ImGui::SameLine(); ImGui::TextDisabled("glass/alpha casters dim + tint the light");
-
-#if VSM_DIAGNOSTICS
-	ImGui::SameLine();
-	ImGui::TextDisabled("light: %s | casters: %d/%d", haveTestLight ? "yes" : "no", visibleCasters, (int)registry.size());
-	ImGui::TextDisabled("build %s", kBuildTag);
-
-	if (ImGui::Button("Dump diagnostic log##VSM"))
-		dbgLogRequested = true;  // writes cameraPos/altEye/light vectors to VirtualShadowMaps.log
-	ImGui::SameLine();
-	if (dumpConfirmFrames > 0) {
-		--dumpConfirmFrames;  // counts down each menu draw; set to kDumpConfirmFrames when the dump actually ran
-		ImGui::TextColored(ImVec4(0.30f, 1.00f, 0.30f, 1.00f), "dump written to VirtualShadowMaps.log");
-	} else if (dbgLogRequested) {
-		ImGui::TextDisabled("dumping...");  // clicked; RenderFrame writes it next frame (needs Enabled)
-	} else {
-		ImGui::TextDisabled("-> VirtualShadowMaps.log");
-	}
-	// Delayed dump — for capturing motion-dependent data (camera-vs-light movement). The menu pauses
-	// input, so an immediate dump always reads zero camera movement; this one fires after a countdown
-	// so you can close the menu and walk/turn while it captures.
-	ImGui::SetNextItemWidth(120.0f);
-	ImGui::SliderInt("##VSMdumpdelay", &dumpDelaySeconds, 2, 15, "%d s");
-	ImGui::SameLine();
-	if (ImGui::Button("Delayed dump (close menu & MOVE)##VSM"))
-		dumpCountdownFrames = dumpDelaySeconds * 60;  // ~60 fps; approximate is fine for a countdown
-	if (dumpCountdownFrames > 0)
-		ImGui::TextColored(ImVec4(1.00f, 0.85f, 0.20f, 1.00f),
-		    "dumping in ~%.1fs — CLOSE THIS MENU and walk/turn now!", dumpCountdownFrames / 60.0f);
-
-	ImGui::Checkbox("Arm real-shader pixel probe##VSM", &probeArmed);
-	ImGui::SameLine();
-	ImGui::TextDisabled(probeArmed ? "move the magenta marker onto the bad shadow, then Dump" : "off (default)");
-	if (probeArmed) {
-		// Movable probe target (fraction of the screen) — so you can put it on a camera-tied artifact
-		// wherever it sits, without needing to aim the camera. A magenta marker shows where it is.
-		settingsDirty |= ImGui::SliderFloat("Probe X##VSM", &probeFracX, 0.0f, 1.0f, "%.3f");
-		settingsDirty |= ImGui::SliderFloat("Probe Y##VSM", &probeFracY, 0.0f, 1.0f, "%.3f");
-		if (auto* dl = ImGui::GetForegroundDrawList()) {
-			const ImVec2 ds = ImGui::GetIO().DisplaySize;
-			const ImVec2 c(probeFracX * ds.x, probeFracY * ds.y);
-			const ImU32 col = IM_COL32(255, 0, 255, 255);
-			dl->AddCircle(c, 8.0f, col, 0, 2.0f);
-			dl->AddLine(ImVec2(c.x - 14, c.y), ImVec2(c.x + 14, c.y), col, 1.5f);
-			dl->AddLine(ImVec2(c.x, c.y - 14), ImVec2(c.x, c.y + 14), col, 1.5f);
-		}
-	}
-
-	// ---- Live shadow tuning: updates the shader immediately via the b13 cbuffer, no rebuild ----
-	ImGui::Separator();
-	ImGui::Text("Shadow tuning (live)");
-
-	// Moving-light smoothing (aesthetics): de-steps swinging lanterns/torches. 1 = off (snap to the
-	// light each frame); lower = smoother glide with more lag. Deploy uses vsm::kLightSmoothAlpha.
-	ImGui::SetNextItemWidth(140.0f);
-	ImGui::SliderFloat("Moving-light smoothing##VSM", &lightSmoothAlpha, 0.05f, 1.0f, "alpha %.2f");
-	ImGui::SameLine(); ImGui::TextDisabled("1 = snap (off); lower = smoother swinging shadows (more lag)");
-
-	// Dimension A: which world-space we PROJECT/MATCH in. The atlas is absolute, so absP is the
-	// fix; 1/2 are controls. Re-tests every mode below without a rebuild.
-	const char* spaces[] = { "0 absP (P + CameraPosAdjust)", "1 P (camera-relative)", "2 P + altEye (C++ render eye)" };
-	ImGui::Combo("Sample space##VSM", &dbgSampleSpace, spaces, IM_ARRAYSIZE(spaces));
-	// Dimension B: how mode 0 compares depths (isolates the linearization math).
-	const char* cmp[] = { "0 linearized distance", "1 raw ndc.z" };
-	ImGui::Combo("Compare (mode 0)##VSM", &dbgCompareMode, cmp, IM_ARRAYSIZE(cmp));
-	// Dimension C: which eye recovers the shader light's absolute position for the buffer match.
-	// LLF's positionWS is relative to posAdjust.getEye() (altEye), not CameraPosAdjust — if they
-	// differ the CameraPosAdjust match drifts with the camera. See mode 22 for the delta.
-	const char* meye[] = { "0 CameraPosAdjust", "1 altEye (posAdjust.getEye)" };
-	ImGui::Combo("Match eye (mode 0)##VSM", &dbgMatchEye, meye, IM_ARRAYSIZE(meye));
-
-	const char* modes[] = {
-		"0 Shadow (real)",
-		"1 Off (fully lit)",
-		"2 absP RGB (control: should stay GLUED)",
-		"3 P RGB (control: moves w/ camera)",
-		"4 Nearest light pos RGB (const/region)",
-		"5 Light->pixel direction RGB",
-		"6 Cube face (6 flat colors)",
-		"7 In FRONT of light? (green=yes)",
-		"8 ndc.xy face coords (RG)",
-		"9 Pixel depth ndc.z (radial gray)",
-		"10 Inside face bounds? (green=yes)",
-		"11 atlasUV we sample (RG)",
-		"12 Raw atlas depth / occluder",
-		"13 Occluder distance",
-		"14 Pixel distance from light",
-		"15 Shadow decision (RED=shadow)",
-		"16 Light matched? (green=yes)",
-		"17 Matched light index (color)",
-		"18 Space delta absP-sample (BLACK=match)",
-		"19 Atlas populated here? (green=depth<1)",
-		"20 Raw-depth shadow decision (RED=shadow)",
-		"21 CameraPosAdjust sanity (RGB)",
-		"22 Eye delta CamPosAdj-altEye (BLACK=equal)",
-		"23 Shadow SOURCE tint: by LIGHT (real shadows painted per-light color)",
-		"24 Shadow SOURCE tint: by FACE (+X red -X grn +Y blu -Y yel +Z mag -Z cyn)",
-		"25 Shadow SOURCE tint: per-OCCLUDER unique color+stripes (shimmers if camera-relative)",
-	};
-	ImGui::Combo("Mode##VSM", &dbgMode, modes, IM_ARRAYSIZE(modes));
-	ImGui::TextWrapped("Modes 2+ paint a pipeline stage as full-screen RGB (mode 0 = real shadow). Pan the "
-	                   "camera: patterns GLUED to surfaces are correct; ones that TRACK the camera are the "
-	                   "broken stage. With Sample space = absP, expect: 2 glued, 6 flat face regions, "
-	                   "7/10 green near lights, 16 green near lights, 18 BLACK. Flip to space 1 to see the "
-	                   "old broken behavior for comparison.");
-	// far/near planes and the shadow bias are all CALCULATED (VSMConstants.h + the shader's receiver-plane
-	// bias); no quality knobs remain. Only Depth-view scale (a debug preview control) stays.
-	ImGui::TextDisabled("far = light radius ; near = far x kNearPlaneFraction ; bias = calculated (all fixed)");
-	ImGui::SliderFloat("Depth-view scale (debug)##VSM", &dbgVizScale, 100.0f, 8192.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
-	ImGui::TextDisabled("skinned rendered %d / dropped %d  (drop = pose spread > radius + margin)", skinnedRendered, skinnedDetached);
-	ImGui::Separator();
-#endif  // VSM_DIAGNOSTICS
-
-	// Persist any changed tuning to VirtualShadowMaps.toml once the control is released. Runs in BOTH
-	// builds so the Enabled toggle still saves in a deploy build.
-	PersistSettingsIfChanged();
-
-#if VSM_DIAGNOSTICS
-	// Everything below is a debug/validation view. When this section is closed,
-	// RenderFrame does no debug-only GPU work at all.
-	showDebug = ImGui::CollapsingHeader("Debug / test view##VSM");
-	if (!showDebug)
-		return;
-
-	ImGui::Text("active lights: %d   |   chosen dist: %.0f", activeLightCount, dbgLightDist);
-	ImGui::SliderInt("Light (-1 = nearest)##VSM", &lightSelect, -1, activeLightCount > 0 ? activeLightCount - 1 : 0);
-	ImGui::TextDisabled("preview = 6 cube faces (3x2): +X -X +Y / -Y +Z -Z");
-	ImGui::SliderFloat("Depth range##VSM", &diag.previewRange, 2.0f, 6000.0f, "%.0f units", ImGuiSliderFlags_Logarithmic);
-	ImGui::SliderFloat("Preview scale##VSM", &previewScale, 0.05f, 1.0f, "%.2f");
-	const int casterCount = static_cast<int>(registry.size());
-	ImGui::SliderInt("Isolate caster##VSM", &isolateCaster, 0, casterCount, isolateCaster == 0 ? "all" : "%d");
-	isolateCaster = (std::min)(isolateCaster, casterCount);
-
-	// ---- Flash a caster's shadow: it blinks on/off in the world so you can find which caster owns a
-	// problem shadow, then read its name. Step through casters until the WRONG shadow is the one blinking.
-	ImGui::Separator();
-	bool flashOn = flashCaster >= 0;
-	if (ImGui::Checkbox("Flash a caster's shadow##VSM", &flashOn))
-		flashCaster = (flashOn && casterCount > 0) ? 0 : -1;
-	if (flashCaster >= 0) {
-		if (ImGui::Button("< prev##VSMflash"))
-			flashCaster = (std::max)(0, flashCaster - 1);
-		ImGui::SameLine();
-		if (ImGui::Button("next >##VSMflash"))
-			flashCaster = (std::min)(casterCount - 1, flashCaster + 1);
-		ImGui::SameLine();
-		ImGui::SetNextItemWidth(220.0f);
-		ImGui::SliderInt("##VSMflashidx", &flashCaster, 0, casterCount > 0 ? casterCount - 1 : 0, "caster %d");
-		flashCaster = std::clamp(flashCaster, 0, casterCount > 0 ? casterCount - 1 : 0);
-		RE::BSGeometry* fg = (flashCaster < casterCount) ? registry[flashCaster].geom.get() : nullptr;
-		ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "blinking #%d: '%s'%s",
-		    flashCaster, (fg && fg->name.c_str()) ? fg->name.c_str() : "?",
-		    (fg && registry[flashCaster].engineOnly) ? " [skinned]" : "");
-	}
-
-	ImGui::Text("light  : %8.0f %8.0f %8.0f", dbgEye.x, dbgEye.y, dbgEye.z);
-	ImGui::Text("camera : %8.0f %8.0f %8.0f", dbgCam.x, dbgCam.y, dbgCam.z);
-	ImGui::Text("aabb   : [%.0f %.0f %.0f]..[%.0f %.0f %.0f]",
-	    diag.dbgCasterMin.x, diag.dbgCasterMin.y, diag.dbgCasterMin.z, diag.dbgCasterMax.x, diag.dbgCasterMax.y, diag.dbgCasterMax.z);
-
-	if (ImGui::Button("Inspect caster (raw bytes)##VSM"))
-		dbgDumpRequested = true;
-	if (diag.dbgHaveDump) {
-		ImGui::Text("stride=%u fullPrec=%d idxCount=%u", diag.dbgStride, (int)diag.dbgFullPrec, diag.dbgIndexCount);
-		for (int i = 0; i < 4; ++i)
-			ImGui::Text("  v%d: %9.2f %9.2f %9.2f", i, diag.dbgV[i].x, diag.dbgV[i].y, diag.dbgV[i].z);
-		ImGui::Text("  idx: %u %u %u %u %u %u", diag.dbgIdx[0], diag.dbgIdx[1], diag.dbgIdx[2], diag.dbgIdx[3], diag.dbgIdx[4], diag.dbgIdx[5]);
-	}
-
-	// Live linear-depth preview: the light's 6 cube faces (near = white, far = black).
-	if (previewSRV) {
-		ImGui::Image((ImTextureID)previewSRV.Get(), ImVec2(rtAtlasW * previewScale, rtAtlasH * previewScale));
-	}
-#endif  // VSM_DIAGNOSTICS
-#endif  // !VSM_DIAGNOSTICS
 }

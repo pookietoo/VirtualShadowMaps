@@ -1,6 +1,5 @@
 #include "VSMConfig.h"
 #include "VSMConstants.h"
-#include "VSMBuildConfig.h"  // VSM_LOG (dev-only info logging)
 
 #include <toml++/toml.hpp>
 
@@ -107,7 +106,6 @@ namespace vsm
 		std::error_code ec;
 		if (!std::filesystem::exists(kConfigPath, ec)) {
 			Save();  // write a documented default so the options are discoverable
-			VSM_LOG("VSM config: no file found; wrote default {}", kConfigPath);
 			return;
 		}
 
@@ -119,11 +117,6 @@ namespace vsm
 			return;
 		}
 
-#if VSM_DIAGNOSTICS
-		// Dev build only: allow the .toml (and the in-menu toggle) to turn VSM off for testing.
-		// Deployment has no off switch by design — it stays hardwired ON; uninstall to disable.
-		enabled       = tbl["general"]["enabled"].value_or(enabled);
-#endif
 		qualityFactor      = tbl["general"]["qualityFactor"].value_or(qualityFactor);
 		cacheStaticShadows = tbl["general"]["cacheStaticShadows"].value_or(cacheStaticShadows);
 		cullCasters        = tbl["general"]["cullCasters"].value_or(cullCasters);
@@ -152,7 +145,6 @@ namespace vsm
 			             "until the plugin is rebuilt.",
 			    faceRes, maxLights, kFaceRes, kMaxLights);
 
-		VSM_LOG("VSM config: loaded {} (enabled={})", kConfigPath, enabled);
 	}
 
 	void Config::Save() const

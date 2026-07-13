@@ -61,46 +61,6 @@ namespace
 	using PresentFn = HRESULT(WINAPI*)(IDXGISwapChain*, UINT, UINT);
 	PresentFn g_origPresent = nullptr;
 
-#if VSM_DIAGNOSTICS
-	// ---- ID3D11DeviceContext::OMSetRenderTargets hook (vtable index 33) — binds our pixel-probe UAV
-	// at u8 alongside whatever render targets a pass sets, ONLY while the probe is armed. This lets
-	// the real Lighting.hlsl write its per-pixel probe. When disarmed it's a pure passthrough. ----
-	using OMSetRTsFn     = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
-	using OMSetRTsUAVsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*, UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*);
-	OMSetRTsFn     g_origOMSetRTs     = nullptr;
-	OMSetRTsUAVsFn g_origOMSetRTsUAVs = nullptr;
-
-	void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* a_ctx, UINT a_num,
-	    ID3D11RenderTargetView* const* a_rtvs, ID3D11DepthStencilView* a_dsv)
-	{
-		auto* vsm = VirtualShadowMaps::GetSingleton();
-		// Only alter state while armed. The probe UAV lives at u8 (render-target outputs occupy u0..u7
-		// in the shared PS OM namespace). Bind it just above the pass's render targets; passes whose PS
-		// doesn't declare u8 simply ignore it, so this is inert for them. Needs FL11.1 at runtime.
-		if (vsm->IsProbeArmed() && g_origOMSetRTsUAVs && a_num >= 1 && a_num <= 8) {
-			if (auto* uav = vsm->GetPixelProbeUAV()) {
-				ID3D11UnorderedAccessView* u = uav;
-				g_origOMSetRTsUAVs(a_ctx, a_num, a_rtvs, a_dsv, 8, 1, &u, nullptr);
-				return;
-			}
-		}
-		g_origOMSetRTs(a_ctx, a_num, a_rtvs, a_dsv);
-	}
-
-	void InstallContextHook(ID3D11DeviceContext* a_ctx)
-	{
-		if (!a_ctx)
-			return;
-		void** vtbl = *reinterpret_cast<void***>(a_ctx);
-		g_origOMSetRTsUAVs = reinterpret_cast<OMSetRTsUAVsFn>(vtbl[34]);  // OMSetRenderTargetsAndUnorderedAccessViews
-		DWORD oldProtect = 0;
-		VirtualProtect(&vtbl[33], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-		g_origOMSetRTs = reinterpret_cast<OMSetRTsFn>(vtbl[33]);
-		vtbl[33] = reinterpret_cast<void*>(&HookedOMSetRenderTargets);
-		VirtualProtect(&vtbl[33], sizeof(void*), oldProtect, &oldProtect);
-		VSM_LOG("VSM: OMSetRenderTargets hook installed (real-shader pixel probe, u8)");
-	}
-#endif  // VSM_DIAGNOSTICS
 
 	// Draw callback CS invokes inside its menu (registered via CS_RegisterExternalMenu).
 	void ExternalDrawMenu()
@@ -134,16 +94,9 @@ namespace
 			return;  // CS menu not initialized yet; retry next frame
 		ImGui::SetCurrentContext(ctx);
 		ImGui::SetAllocatorFunctions(alloc, free, ud);
-#if VSM_DIAGNOSTICS
-		// Dev build: keep the diagnostics panel floating at the top of the CS window
-		// (empty category = original top-of-window hook) — always visible, no clicking in.
-		reg("Virtual Shadow Maps", "", &ExternalDrawMenu);
-#else
 		// Deployment build: list under the CS "Lighting" category beside Light Limit Fix, our host feature.
 		reg("Virtual Shadow Maps", "Lighting", &ExternalDrawMenu);
-#endif
 		done = true;
-		VSM_LOG("VSM: registered menu with Community Shaders");
 	}
 
 	HRESULT WINAPI HookedPresent(IDXGISwapChain* a_this, UINT a_sync, UINT a_flags)
@@ -163,7 +116,6 @@ namespace
 		g_origPresent = reinterpret_cast<PresentFn>(vtbl[8]);
 		vtbl[8] = reinterpret_cast<void*>(&HookedPresent);
 		VirtualProtect(&vtbl[8], sizeof(void*), oldProtect, &oldProtect);
-		VSM_LOG("VSM: Present hook installed");
 	}
 
 	void InitializeLog()
@@ -199,7 +151,6 @@ namespace
 		// write_vfunc returns the original; we never call it back (we permanently skip), so discard safely.
 		[[maybe_unused]] const auto origFrustum   = frustumVtbl.write_vfunc(0x0A, &SkipLocalShadowRender);
 		[[maybe_unused]] const auto origParabolic = parabolicVtbl.write_vfunc(0x0A, &SkipLocalShadowRender);
-		VSM_LOG("VSM: engine local-light shadow generation suppressed (spot + omni Render() no-op'd; sun untouched)");
 	}
 
 	void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
@@ -216,32 +167,24 @@ namespace
 		auto* device = reinterpret_cast<ID3D11Device*>(rd.forwarder);
 		auto* context = reinterpret_cast<ID3D11DeviceContext*>(rd.context);
 		auto* swapChain = reinterpret_cast<IDXGISwapChain*>(rd.renderWindows->swapChain);
-		VSM_LOG("VSM: D3D device={} context={} swapChain={}",
-		    (void*)device, (void*)context, (void*)swapChain);
 
 		if (swapChain) {
 			DXGI_SWAP_CHAIN_DESC scd{};
 			if (SUCCEEDED(swapChain->GetDesc(&scd))) {
 				VirtualShadowMaps::GetSingleton()->SetRenderSize(scd.BufferDesc.Width, scd.BufferDesc.Height);
-				VSM_LOG("VSM: render size {}x{} (pixel-probe target = centre)", scd.BufferDesc.Width, scd.BufferDesc.Height);
 			}
 		}
 
 		VirtualShadowMaps::GetSingleton()->OnD3DReady(device, context);
 		InstallPresentHook(swapChain);
 		InstallLocalShadowSuppress();  // Q1: stop the engine wasting GPU on local-light shadow maps VSM replaces
-#if VSM_DIAGNOSTICS
-		InstallContextHook(context);  // for the real-shader pixel probe (only acts while armed)
-#endif
 
-		VSM_LOG("VSM: ready. Settings appear in the Community Shaders menu under 'Virtual Shadow Maps'.");
 	}
 }
 
 extern "C" DLLEXPORT bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
 {
 	InitializeLog();
-	VSM_LOG("Loaded {} {}", Plugin::NAME, Plugin::VERSION);
 	SKSE::Init(a_skse);
 	SKSE::AllocTrampoline(1 << 10);
 	SKSE::GetMessagingInterface()->RegisterListener("SKSE", MessageHandler);

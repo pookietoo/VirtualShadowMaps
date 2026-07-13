@@ -1,10 +1,10 @@
 #ifndef VSM_HLSLI
 #define VSM_HLSLI
 
-// Virtual Shadow Maps — samples our owned cube-shadow atlas for a local light.
+// Virtual Shadow Maps — samples the plugin's cube-shadow atlas for a local light.
 // Bound by LightLimitFix::Prepass (t110/t111/s7 via VirtualShadowMaps.dll). The layout and
 // cube-face order below MUST match VirtualShadowMaps.h (LightRecord / atlas) and
-// VirtualShadowMaps.cpp::BuildCubeMatrices. This file ships with CS but is our logic.
+// VirtualShadowMaps.cpp::BuildCubeMatrices. This file ships with CS but is part of the plugin.
 namespace VSM
 {
 	// The ShadowLights buffer is DYNAMIC (grows with the active shadow-light count — there is NO fixed cap).
@@ -12,8 +12,8 @@ namespace VSM
 	// size. Atlas DIMENSIONS are RUNTIME too (gAtlasW/gAtlasH, b13 cbuffer) from iShadowMapResolution — never
 	// hard-code them here; the old compile-time kFaceRes/kBlockW/kAtlasW/kAtlasH mis-sampled the atlas at res != 256.
 
-	// Named tunable/sentinel constants (rename+document only — values are the historical magic numbers,
-	// unchanged). Namespace scope so every function below shares one definition.
+	// Named tunable/sentinel constants (renamed and documented; the values are unchanged).
+	// Namespace scope so every function below shares one definition.
 	static const float kNdotLFloor  = 0.05;  // min N·L in the bias calc — clamps grazing slope so tan(incidence) stays finite
 	static const float kProbeAccept = 1.5;   // probe target half-window (pixels) around the render centre
 	static const float kEmptySlotMin = 1.0;  // dot(rp,rp) below this = empty ShadowLights slot -> skip
@@ -277,14 +277,14 @@ namespace VSM
 						} else {
 							linPix = macd;   // cube-direct: axial distance IS the compare depth (no linearize-of-ndc.z)
 							linOcc = LinearizeCubeDepth(occluder, L.nearPlane, L.farPlane);
-							// CALCULATED receiver-plane bias — replaces the gBiasWorld magic slider AND the dead
+							// CALCULATED receiver-plane bias — replaces the gBiasWorld slider AND the dead
 							// rasterizer DepthBias (=~0.19u on a D32_FLOAT atlas, useless). A receiver's distance
 							// to the light can differ from the nearest surface stored in its atlas texel by up to
 							// the texel's lateral footprint x the surface slope vs the light: footprint =
 							// linPix*(2/gFaceRes) (a cube face spans tan[-1,1] over gFaceRes texels); slope =
 							// tan(incidence) from the G-buffer normal; x2 = texel diagonal + point-sample jitter.
 							// Face-on (normal toward light) -> slope~0 -> ~no bias; grazing -> large, exactly
-							// where the self-shadow acne lives. No magic constant, no slider.
+							// where the self-shadow acne lives. No tuned constant, no slider.
 							float3 Ldir      = normalize(L.positionWS.xyz - W);
 							float  ndl       = max(dot(worldNormal, Ldir), kNdotLFloor);
 							float  slope     = sqrt(saturate(1.0 - ndl * ndl)) / ndl;  // tan(incidence) from the G-buffer normal
@@ -306,12 +306,12 @@ namespace VSM
 									cnt += 1.0;
 								}
 							shadow = sum / cnt;  // 0=shadowed .. 1=lit (fractional=penumbra); pr=0 -> single tap (hard)
-							// NO far-distance fade here — we MATCH CS's light falloff instead of imposing our own. CS already
-							// multiplies our shadow by the light's own attenuation (Lighting.hlsl: lightColor *= intensityMultiplier
+							// NO far-distance fade here — CS's light falloff is matched instead of imposing another. CS already
+							// multiplies the shadow by the light's own attenuation (Lighting.hlsl: lightColor *= intensityMultiplier
 							// = InverseSquareLighting::GetAttenuation, which smoothsteps to 0 at the radius), so the shadow's
-							// visible effect vanishes exactly as the light does. The old linear fadeA1 double-faded on a MISMATCHED
-							// curve (12% linear vs CS's inverse-square) — that lift, while CS's light is still bright, was the
-							// visible border. Deleting it hooks CS's fade for free and tracks their updates.
+							// visible effect vanishes exactly as the light does. An added linear fade would double-fade on a MISMATCHED
+							// curve (linear vs inverse-square) and lift a visible border while the light is
+							// still bright.
 						}
 						// Tint modes: record what shadowed this pixel so Lighting.hlsl can paint it.
 						if ((gMode == 23 || gMode == 24 || gMode == 25) && shadow < 0.5) {
@@ -377,7 +377,7 @@ namespace VSM
 	//   23 = matched LIGHT index (few colours; same palette as mode 17)
 	//   24 = cube FACE (+X red, -X green, +Y blue, -Y yellow, +Z magenta, -Z cyan)
 	//   25 = per-OCCLUDER unique colour + stripe pattern (thousands of distinct ids; SHIMMERS if the
-	//        occluder is camera-relative). Read the problem shadow's colour/pattern off-screen and I
+	//        occluder is camera-relative). Read the problem shadow's colour/pattern off-screen and
 	//        match it in the dump.
 	bool WantsShadowTint() { return gMode == 23 || gMode == 24 || gMode == 25; }
 

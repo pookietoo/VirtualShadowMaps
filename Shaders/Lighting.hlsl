@@ -2684,7 +2684,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 		float intensityMultiplier = 1 - intensityFactor * intensityFactor;
 		float3 lightColor = Color::PointLight(PointLightColor[lightIndex].xyz) * intensityMultiplier;
-		// VSM: engine's 4-slot local shadow mask stays bypassed; only OUR atlas shadows local lights.
+		// VSM: engine's 4-slot local shadow mask stays bypassed; only the VSM atlas shadows local lights.
 		float lightShadow = 1.f;
 		float3 vsmTransmittance;  // A5 colored translucent shadows (glass tint/dim); white when the module is off
 		lightShadow *= VSM::GetLocalShadow(PointLightPosition[lightIndex].xyz, input.WorldPosition.xyz, input.Position.xy, worldNormal, vsmTransmittance);
@@ -2774,7 +2774,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		lightShadow *= VSM::GetLocalShadow(light.vsmShadowIndex, input.WorldPosition.xyz, input.Position.xy, worldNormal, vsmTransmittance);  // VSM PATCH (light-index alignment): pass the O(1) index LLF stamped, not the position — manifest P5
 		lightColor *= vsmTransmittance;
 
-		// VSM: engine's 4-slot local shadow mask stays bypassed; only OUR atlas shadows local
+		// VSM: engine's 4-slot local shadow mask stays bypassed; only the VSM atlas shadows local
 		// lights. shadowComponent stays 1.0 so the parallax self-shadow gate below still behaves.
 		float shadowComponent = 1.0;
 

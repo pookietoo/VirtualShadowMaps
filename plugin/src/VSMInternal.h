@@ -1,8 +1,7 @@
 #pragma once
 
 // ============================================================================
-// Internal helpers shared between the core render path (VirtualShadowMaps.cpp)
-// and the diagnostics translation unit (VirtualShadowMaps_Diagnostics.cpp).
+// Internal helpers used by the core render path (VirtualShadowMaps.cpp).
 // These are implementation details, not part of the public class in
 // VirtualShadowMaps.h. Relies on PCH.h (force-included) for RE:: types + ComPtr.
 // ============================================================================

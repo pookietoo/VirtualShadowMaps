@@ -36,6 +36,11 @@ docs/
 plugin/src/VirtualShadowMaps_Diagnostics.cpp
 plugin/src/VirtualShadowMaps_Diagnostics.h
 
+# ---- Full local development copy. root/ is the CLEAN GitHub mirror (deployment-only, no diagnostics);
+# ---- dev/ keeps the full apparatus (VSM_DEV_BUILD, debug menu, logging, diagnostics). Develop in dev/,
+# ---- strip to root, push root. NEVER published. ----
+/dev/
+
 # ---- Holding area for removed code (user empties this) ----
 trash/
 

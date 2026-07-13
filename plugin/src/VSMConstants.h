@@ -55,10 +55,10 @@ namespace vsm
 	inline constexpr std::uint64_t kSlotEvictFrames    = 90;    // free a light's persistent atlas slot after this many frames unseen (LRU)
 	inline constexpr float         kLightMoveEps       = 0.5f;  // world-units a collected light must move to invalidate the P2 static cache
 	// Moving-light shadow smoothing (aesthetics). Swinging lanterns/torches update their position in
-	// discrete Havok/animation steps; rendering each step faithfully reads as jerky. We low-pass the
-	// cube CENTER we generate + sample from toward the light's true position so the shadow glides.
-	// Beauty over accuracy: the shadow lags the light slightly; the bright hotspot (driven by the game's
-	// own light position, not smoothed) has soft falloff that hides the tiny desync.
+	// discrete Havok/animation steps; rendering each step faithfully looks jerky. Low-pass the cube
+	// CENTER we generate + sample from toward the light's true position so the shadow motion is smooth.
+	// The shadow lags the light slightly; the bright hotspot (driven by the game's own light position,
+	// not smoothed) has soft falloff that hides the small desync.
 	inline constexpr float         kLightSmoothAlpha    = 0.30f;  // per-frame lerp toward the true position (~tuned @60fps). 1 = off/snap; lower = smoother + more lag.
 	inline constexpr float         kLightSmoothSnapDist = 160.0f; // world-units: a per-frame jump larger than this is a TELEPORT (cell load / reposition) -> snap, don't glide across the room.
 	inline constexpr std::uint64_t kLightGraceFrames   = 30;    // keep a light shadowed this many frames after it last appeared (anti-flicker debounce)
