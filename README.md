@@ -6,8 +6,7 @@ Skyrim only allows shadows from a handful of local lights at once. Virtual Shado
 standalone [SKSE](https://skse.silverlock.org/) plugin that
 renders its **own** cube-shadow atlas for the active local lights the engine dropped, and feeds it
 to [Community Shaders](https://github.com/doodlum/skyrim-community-shaders)' Light Limit Fix so its
-`Lighting.hlsl` samples our shadows. The plugin owns all of its logic — Community Shaders only
-exposes a tiny generic menu hook, so nothing of ours lives in CS's DLL.
+`Lighting.hlsl` samples our shadows. 
 
 ## Status
 
