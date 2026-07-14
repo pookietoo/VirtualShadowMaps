@@ -29,8 +29,6 @@ Implemented but not yet validated in-game:
 
 - **Colored translucent shadows** — glass / alpha-blended surfaces dim and tint the light passing
   through them instead of being excluded (needs the matching Community Shaders build).
-- **Engine shadow suppression** — the engine's own, now-redundant local-light shadow maps are
-  skipped to save GPU (intended to change nothing visible).
 - **Moving-light smoothing** — swinging lanterns/torches are de-stepped so their shadows glide
   rather than jerk with the animation.
 

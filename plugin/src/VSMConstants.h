@@ -37,18 +37,11 @@ namespace vsm
 	// non-pow2); every rung below is a power of two. Detail follows on-screen importance: a big/near light
 	// gets a high rung, a small/distant one drops to the floor — so many lights stay affordable in VRAM.
 	inline constexpr int   kFloorFaceRes    = 128;    // smallest per-light cube-face resolution = the atlas page/quantum
-	inline constexpr float kQualityFactor   = 1.0f;   // k: target shadow texels per screen pixel (menu-configurable later)
+	inline constexpr int   kMaxFaceResCeiling = 8192; // hard ceiling on a cube-face resolution rung (D3D max-texture guard on the iShadowMapResolution-derived top rung)
 	inline constexpr float kLevelHysteresis = 0.25f;  // hold a light's rung until desired res moves >25% (anti-flicker)
 	inline constexpr float kTanHalfFovV     = 0.577f; // ~60deg vertical-FOV proxy for the screen-size metric (approx; k absorbs error)
 	inline constexpr int   kAtlasBlocksWide = 4;      // packer target width = this many MAX-size light blocks across
 	inline constexpr int   kMaxPCFRadius    = 4;      // clamp for the runtime soft-shadow PCF half-width (from iBlurDeferredShadowMask); caps per-pixel tap cost
-
-	// ---- Debug preview linearizer near/far ----
-	// Used ONLY by the grayscale atlas-preview shader, to map perspective depth to a
-	// readable gradient. These are NOT the per-light shadow planes (those come from each
-	// light's radius in CollectLights).
-	inline constexpr float kPreviewNear = 8.0f;
-	inline constexpr float kPreviewFar  = 8192.0f;
 
 	// ---- Fixed capacities / cadence ----
 	inline constexpr std::uint32_t kRebuildInterval    = 30;    // frames between scene-graph re-traversals
@@ -78,14 +71,6 @@ namespace vsm
 	inline constexpr float kNearPlaneFraction = 0.01f;   // near = far * this
 	inline constexpr float kNearPlaneEpsilon  = 0.1f;    // absolute world-unit floor on the near plane
 
-	// ---- Debug-overlay-only params ----
-	// The b13 gBiasWorld / gMatchThresh cbuffer fields feed ONLY diagnostic overlay modes 15/16. The REAL
-	// shadow path uses a calculated receiver-plane bias and a threshold-free nearest-light match, so these
-	// are no longer user knobs — they're fixed values the debug viz reads.
-	inline constexpr float kDebugModeBias        = 3.0f;  // mode 15 (linPix-linOcc > this) viz
-	inline constexpr float kDebugModeMatchThresh = 5.0f;  // mode 16 (nearest-light dist < this) viz
-
-	// (Former kMaxShadowMagnification / spatial fixture cull removed; billboards are now excluded at registry build instead.)
 
 	// ---- CS <-> plugin resource-binding CONTRACT ----
 	// Community Shaders' LightLimitFix::Prepass fetches our resources (see VSM_GetShadowResources in

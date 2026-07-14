@@ -11,11 +11,11 @@
 
 namespace vsm::internal
 {
-	// Human-readable build label shown in the menu + diagnostic dump, so it's obvious which
-	// plugin DLL is actually running. Bump the description each build. (The SKSE plugin version
-	// number is separate — see Plugin.h / CMake project VERSION.)
+	// Human-readable build label shown in the (dev) menu, so it's obvious which plugin DLL is
+	// actually running. Bump the description each build. (The SKSE plugin version number is
+	// separate — see Plugin.h / CMake project VERSION.)
 	inline constexpr char kBuildTag[] =
-	    "0.9.101 - menu moved into the CS Lighting category (deploy = attribution only, hardwired on), engine local-light shadow generation suppressed for perf, and moving-light shadows smoothed to de-step swinging lanterns.";
+	    "0.9.101 - code-review cleanup: dead dev-diagnostics + id/preview atlases stripped, t111 shrunk to a 32-byte GPU record (cubeVP CPU-only), shadow atlas depth-only; deploy = attribution-only in the CS Lighting category, no config file.";
 
 	// Depth convention for the shadow atlas. TRUE = reverse-Z (near->1, far->0), which is Skyrim's own
 	// main-view convention and gives uniform float-depth precision across the light's range. This flag is the
@@ -88,20 +88,4 @@ namespace vsm::internal
 		}
 	};
 
-	// (Former ProbeIn / ProbeOut / ProbeCBData compute-probe I/O structs removed; superseded by the pixel probe below.)
-
-	// Real-shader pixel probe readback (MUST match VSM.hlsli::VSMPixelProbe — 10 float4 = 160 bytes).
-	struct PixelProbe
-	{
-		DirectX::XMFLOAT4 pixel;       // xy = SV_Position, z = written(1 => shader wrote this), w = mode
-		DirectX::XMFLOAT4 P;           // input.WorldPosition (camera-relative) as the REAL shader received it
-		DirectX::XMFLOAT4 camAdjust;   // REAL FrameBuffer::CameraPosAdjust.xyz — resolves the last assumption
-		DirectX::XMFLOAT4 W;           // SampleP(P).xyz, w = sampleSpace
-		DirectX::XMFLOAT4 lightPosWS;  // light as LLF passed it
-		DirectX::XMFLOAT4 absLight;    // match key
-		DirectX::XMFLOAT4 matched;     // x = matched index, y = face, z = inBounds, w = inFront
-		DirectX::XMFLOAT4 ndc;         // xyz = ndc, w = clip.w
-		DirectX::XMFLOAT4 uv_occ;      // xy = atlasUV, z = occluder, w = reason(0 eval,1 mode,2 no-match,3 behind,4 oob)
-		DirectX::XMFLOAT4 result;      // x = linPix, y = linOcc, z = diff, w = shadow (0 = shadowed)
-	};
 }

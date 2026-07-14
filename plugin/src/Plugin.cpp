@@ -1,8 +1,6 @@
 #include "VirtualShadowMaps.h"
 #include "Plugin.h"
 
-#include "RE/B/BSShadowFrustumLight.h"
-#include "RE/B/BSShadowParabolicLight.h"
 #include <imgui.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
@@ -15,20 +13,19 @@ extern "C" DLLEXPORT void VSM_GetShadowResources(
     ID3D11ShaderResourceView** a_atlas,
     ID3D11ShaderResourceView** a_lightBuffer,
     ID3D11SamplerState**       a_sampler,
-    ID3D11Buffer**             a_debugCB,
+    ID3D11Buffer**             a_paramsCB,
     int*                       a_lightCount,
     bool*                      a_enabled)
 {
 	auto* vsm = VirtualShadowMaps::GetSingleton();
-	vsm->NoteResourceFetch();  // record the CS<->plugin handshake for the diagnostic dump
 	if (a_atlas)
 		*a_atlas = vsm->GetAtlasSRV();
 	if (a_lightBuffer)
 		*a_lightBuffer = vsm->GetLightBufferSRV();
 	if (a_sampler)
 		*a_sampler = vsm->GetPointSampler();
-	if (a_debugCB)
-		*a_debugCB = vsm->GetDebugCB();
+	if (a_paramsCB)
+		*a_paramsCB = vsm->GetParamsCB();
 	if (a_lightCount)
 		*a_lightCount = vsm->GetShadowLightCount();
 	if (a_enabled)
@@ -132,27 +129,6 @@ namespace
 		spdlog::set_pattern("[%H:%M:%S.%e] [%l] [%s:%#] %v");
 	}
 
-	// ---- Q1: suppress the engine's native LOCAL-light shadow-map generation ---------------------
-	// The engine still renders shadow maps for spot (BSShadowFrustumLight) and point/omni
-	// (BSShadowParabolicLight) shadow-casting lights every frame, even though VSM replaces those
-	// shadows with our atlas and our forked Lighting.hlsl no longer samples the engine's local mask
-	// (shadowComponent = 1.0). That generation is pure wasted GPU. We no-op each light's Render()
-	// (BSShadowLight vtable index 0x0A) so the engine skips it. The SUN (BSShadowDirectionalLight) is
-	// deliberately LEFT ALONE — its shadow is Skyrim's, not ours.
-	// NOTE: the engine already tolerates a varying shadow-light count frame to frame (scenes with no
-	// local shadow casters are normal), so leaving a_index unadvanced is within its normal range.
-	// UNVERIFIED in-game — if shadows/stability regress, this hook is the first suspect (self-contained).
-	void SkipLocalShadowRender(RE::BSShadowLight*, std::uint32_t&) {}  // intentionally render nothing
-
-	void InstallLocalShadowSuppress()
-	{
-		REL::Relocation<std::uintptr_t> frustumVtbl{ RE::VTABLE_BSShadowFrustumLight[0] };      // spot lights
-		REL::Relocation<std::uintptr_t> parabolicVtbl{ RE::VTABLE_BSShadowParabolicLight[0] };  // point/omni lights
-		// write_vfunc returns the original; we never call it back (we permanently skip), so discard safely.
-		[[maybe_unused]] const auto origFrustum   = frustumVtbl.write_vfunc(0x0A, &SkipLocalShadowRender);
-		[[maybe_unused]] const auto origParabolic = parabolicVtbl.write_vfunc(0x0A, &SkipLocalShadowRender);
-	}
-
 	void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
 	{
 		if (a_msg->type != SKSE::MessagingInterface::kDataLoaded)
@@ -177,8 +153,6 @@ namespace
 
 		VirtualShadowMaps::GetSingleton()->OnD3DReady(device, context);
 		InstallPresentHook(swapChain);
-		InstallLocalShadowSuppress();  // Q1: stop the engine wasting GPU on local-light shadow maps VSM replaces
-
 	}
 }
 

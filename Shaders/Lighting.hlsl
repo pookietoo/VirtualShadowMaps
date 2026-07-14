@@ -2684,11 +2684,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 		float intensityMultiplier = 1 - intensityFactor * intensityFactor;
 		float3 lightColor = Color::PointLight(PointLightColor[lightIndex].xyz) * intensityMultiplier;
-		// VSM: engine's 4-slot local shadow mask stays bypassed; only the VSM atlas shadows local lights.
+		// VSM operates ONLY with Light Limit Fix; with LLF off there is no VSM shadow for engine point lights.
 		float lightShadow = 1.f;
-		float3 vsmTransmittance;  // A5 colored translucent shadows (glass tint/dim); white when the module is off
-		lightShadow *= VSM::GetLocalShadow(PointLightPosition[lightIndex].xyz, input.WorldPosition.xyz, input.Position.xy, worldNormal, vsmTransmittance);
-		lightColor *= vsmTransmittance;
 
 		float3 normalizedLightDirection = normalize(lightDirection);
 
@@ -3394,10 +3391,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #	endif
 
-	[branch] if (VSM::WantsShadowTint())  // VSM: repaint OUR shadows by their source (menu Mode 23=light, 24=face)
-		psout.Diffuse.xyz = VSM::ShadowTint(psout.Diffuse.xyz);
-	else [branch] if (VSM::WantsDebugOverride())  // VSM diagnostic: paint a pipeline stage as RGB (menu Mode >= 2)
-		psout.Diffuse.xyz = VSM::DebugColor(input.WorldPosition.xyz);
 	return psout;
 }
 #endif  // PSHADER
