@@ -41,6 +41,9 @@ plugin/src/VirtualShadowMaps_Diagnostics.h
 # ---- strip to root, push root. NEVER published. ----
 /dev/
 
+# ---- Nexus mod-page description (local copy; not needed to build or use the mod) ----
+nexus_description.txt
+
 # ---- Holding area for removed code (user empties this) ----
 trash/
 
