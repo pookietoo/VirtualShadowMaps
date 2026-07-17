@@ -213,7 +213,9 @@ void VirtualShadowMaps::ComputeAtlasDims()
 	// between these bounds by AssignFaceRes; this only sets the BOUNDS + the packer/diagnostics reference.
 	int fr = (ini >= vsm::kFloorFaceRes) ? ini : kFaceRes;
 	if (fr < vsm::kFloorFaceRes) fr = vsm::kFloorFaceRes;
-	if (fr > 8192) fr = 8192;
+	// Cap the top rung so a single light's 3-wide cube block fits the D3D11 texture-size limit (rung*3 <= 16384).
+	// A higher iShadowMapResolution (e.g. 8192) is clamped here rather than overflowing the atlas texture.
+	if (fr > vsm::kMaxFaceResCeiling) fr = vsm::kMaxFaceResCeiling;
 	rtMaxFaceRes   = fr;
 	rtFloorFaceRes = (std::min)(static_cast<int>(vsm::kFloorFaceRes), rtMaxFaceRes);
 	rtFaceRes = rtMaxFaceRes;      // reference = the MAX rung (packer target-width unit + diagnostics)
@@ -554,6 +556,21 @@ void VirtualShadowMaps::SetupResources()
 
 	registry.reserve(kRegistryReserve);  // avoid per-frame reallocation churn
 
+	// m2: only run if every CORE resource was actually created. Several Create* calls above don't check their
+	// HRESULT; if the depth VS / input layout / a pipeline state / a buffer failed on a broken or OOM driver,
+	// proceeding would bind a null shader/layout/state and silently produce no shadows (or a device error).
+	// Leaving resourcesReady false makes RenderFrame a clean no-op instead. (A5/A6 shaders are optional — those
+	// features just stay inert — so they are NOT required here.)
+	if (!depthVS || !ilFull || !rasterState || !rasterStateNoCull || !depthState ||
+	    !perDrawCB || !paramsCB || !pointSampler || !lightBuffer || !srv) {
+		logger::error("VSM: core resource creation failed (depthVS={} ilFull={} rasterState={} rasterStateNoCull={} "
+		              "depthState={} perDrawCB={} paramsCB={} pointSampler={} lightBuffer={} srv={}) — VSM disabled",
+		    static_cast<bool>(depthVS), static_cast<bool>(ilFull), static_cast<bool>(rasterState),
+		    static_cast<bool>(rasterStateNoCull), static_cast<bool>(depthState), static_cast<bool>(perDrawCB),
+		    static_cast<bool>(paramsCB), static_cast<bool>(pointSampler), static_cast<bool>(lightBuffer), static_cast<bool>(srv));
+		return;  // resourcesReady stays false -> RenderFrame early-returns cleanly
+	}
+
 	resourcesReady = true;
 }
 
@@ -612,27 +629,44 @@ int VirtualShadowMaps::AssignFaceRes(float a_radius, const RE::NiPoint3& a_light
 void VirtualShadowMaps::PackAtlas()
 {
 	++atlasFrame;
-	const int targetW = vsm::kAtlasBlocksWide * (rtMaxFaceRes * vsm::kCubeFacesWide);
+	// Shelf-wrap width, clamped to the D3D11 texture-size limit so the atlas can never grow past it.
+	const int capW = (std::min)(vsm::kAtlasBlocksWide * (rtMaxFaceRes * vsm::kCubeFacesWide), vsm::kMaxAtlasDim);
 	auto freeKey = [](int w, int h) {
 		return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(w)) << 32) | static_cast<std::uint32_t>(h);
 	};
 	auto releaseSlot = [&](const AtlasSlot& s) { freeSlots[freeKey(s.w, s.h)].emplace_back(s.x, s.y); };
 	// Allocate a NEW slot: reuse a freed same-size slot (no fragmentation for same-size churn), else shelf-bump.
-	auto allocSlot = [&](int bw, int bh, int fr) -> AtlasSlot {
+	// Returns false when the block will not fit within kMaxAtlasDim — the caller then leaves that light unslotted
+	// (it renders unshadowed, a fail-safe) instead of overflowing the atlas texture. Cursor is advanced ONLY on
+	// success, so a too-big block that is refused doesn't waste the current shelf for the smaller blocks after it.
+	auto allocSlot = [&](int bw, int bh, int fr, AtlasSlot& a_out) -> bool {
 		auto& fl = freeSlots[freeKey(bw, bh)];
-		if (!fl.empty()) {
+		if (!fl.empty()) {  // a freed same-size slot is already inside the current (in-bounds) atlas
 			const auto [fx, fy] = fl.back(); fl.pop_back();
-			return { fx, fy, bw, bh, fr, atlasFrame };
+			a_out = { fx, fy, bw, bh, fr, atlasFrame };
+			return true;
 		}
-		if (atlasBumpX > 0 && atlasBumpX + bw > targetW) { atlasBumpX = 0; atlasBumpY += atlasBumpRowH; atlasBumpRowH = 0; }  // wrap shelf
-		AtlasSlot s{ atlasBumpX, atlasBumpY, bw, bh, fr, atlasFrame };
-		atlasBumpX += bw;
-		if (bh > atlasBumpRowH) atlasBumpRowH = bh;
-		return s;
+		int bx = atlasBumpX, by = atlasBumpY, rowH = atlasBumpRowH;
+		if (bx > 0 && bx + bw > capW) { bx = 0; by += rowH; rowH = 0; }  // wrap to a new shelf
+		if (bx + bw > vsm::kMaxAtlasDim || by + bh > vsm::kMaxAtlasDim)
+			return false;   // no room within the texture-size limit -> refuse (light stays unshadowed)
+		atlasBumpX    = bx + bw;
+		atlasBumpY    = by;
+		atlasBumpRowH = (bh > rowH) ? bh : rowH;
+		a_out = { bx, by, bw, bh, fr, atlasFrame };
+		return true;
 	};
 
-	// 1. Give each active light a STABLE slot: reuse if the tier is unchanged, else (re)allocate.
-	for (size_t i = 0; i < lightRecords.size(); ++i) {
+	// 1. Give each active light a STABLE slot: reuse if the tier is unchanged, else (re)allocate. Assign in
+	//    importance order (faceRes desc) so that if the atlas fills, the lights left without a slot — and thus
+	//    rendered unshadowed — are the least on-screen-important ones.
+	std::vector<size_t> order(lightRecords.size());
+	for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+	std::sort(order.begin(), order.end(),
+	    [&](size_t a, size_t b) { return lightRecords[a].positionWS.w > lightRecords[b].positionWS.w; });
+
+	std::vector<bool> hasSlot(lightRecords.size(), false);
+	for (const size_t i : order) {
 		const void* id = (i < lightPtrs.size()) ? lightPtrs[i] : nullptr;
 		const int   fr = static_cast<int>(lightRecords[i].positionWS.w);
 		const int   bw = fr * vsm::kCubeFacesWide, bh = fr * vsm::kCubeFacesTall;
@@ -641,27 +675,94 @@ void VirtualShadowMaps::PackAtlas()
 			it->second.lastUsed = atlasFrame;                                   // reuse -> slot STABLE (cache survives)
 		} else {
 			if (it != lightSlots.end()) { releaseSlot(it->second); lightSlots.erase(it); }  // tier changed -> free old block
-			it = lightSlots.emplace(id, allocSlot(bw, bh, fr)).first;
+			AtlasSlot s;
+			if (!allocSlot(bw, bh, fr, s))
+				continue;               // atlas full within kMaxAtlasDim -> leave unslotted (rendered unshadowed)
+			it = lightSlots.emplace(id, s).first;
 			staticCacheValid = false;   // P2: a new/moved slot -> any baked static for this light is now in the wrong block
 			dirtyLights.insert(id);     // P4: this light's block moved -> only ITS static cache must re-bake (not the whole atlas)
 			bakedPose.erase(id);        // P4: the new block is uncleared -> treat as "new" so it bakes immediately (not budget-deferred)
 		}
 		lightRecords[i].atlasX = static_cast<float>(it->second.x);
 		lightRecords[i].atlasY = static_cast<float>(it->second.y);
+		hasSlot[i] = true;
 	}
+
+	// 1b. Drop the lights that couldn't get a slot: compact them out of this frame's shadowed set (stable order).
+	//     UploadLightBuffer then omits them from lightIndexByPtr, so LLF stamps kNoShadowIndex and the shader
+	//     renders them lit. This BOUNDS the atlas instead of overflowing the texture (which would kill ALL shadows).
+	{
+		size_t w = 0;
+		const size_t nPtrs = lightPtrs.size();
+		for (size_t i = 0; i < lightRecords.size(); ++i) {
+			if (!hasSlot[i]) continue;
+			if (w != i) {
+				lightRecords[w] = lightRecords[i];
+				if (i < nPtrs) lightPtrs[w] = lightPtrs[i];
+			}
+			++w;
+		}
+		if (w < lightRecords.size()) {
+			const size_t dropped = lightRecords.size() - w;
+			lightRecords.resize(w);
+			if (w < lightPtrs.size()) lightPtrs.resize(w);
+			activeLightCount = static_cast<int>(w);
+			// No silent caps: log the drop, rate-limited so a persistently-full atlas doesn't spam every frame.
+			if (atlasFrame % 300 == 0)
+				logger::warn("VSM: atlas full at {}x{} (limit {}) — {} least-important light(s) left unshadowed this frame",
+				    rtAtlasW, rtAtlasH, vsm::kMaxAtlasDim, dropped);
+		}
+	}
+
 	// 2. LRU: release slots not used for a while so their space recycles (bounds the atlas over cell churn).
 	for (auto it = lightSlots.begin(); it != lightSlots.end();) {
 		if (atlasFrame - it->second.lastUsed > vsm::kSlotEvictFrames) { releaseSlot(it->second); it = lightSlots.erase(it); }
 		else ++it;
 	}
 	// 3. Grow the atlas to the shelf high-water mark (grow-only; slot pixel origins stay valid across a grow).
-	const int needW = (std::max)((atlasBumpY > 0) ? targetW : atlasBumpX, rtFloorFaceRes * 3);
+	//    needW/needH are bounded by kMaxAtlasDim (allocSlot refuses anything larger), so CreateAtlasResources can
+	//    only fail now on a genuine OOM — in which case ROLL BACK to the last-good size and recreate, so a failed
+	//    grow never leaves the atlas stuck null (which previously disabled all shadows for the rest of the session).
+	const int needW = (std::max)((atlasBumpY > 0) ? capW : atlasBumpX, rtFloorFaceRes * 3);
 	const int needH = (std::max)(atlasBumpY + atlasBumpRowH, rtFloorFaceRes * 2);
 	if (needW > rtAtlasW || needH > rtAtlasH) {
+		const int prevW = rtAtlasW, prevH = rtAtlasH;
 		rtAtlasW = (needW > rtAtlasW) ? needW : rtAtlasW;
 		rtAtlasH = (needH > rtAtlasH) ? needH : rtAtlasH;
-		if (!CreateAtlasResources())
-			logger::error("VSM: atlas grow to {}x{} FAILED (out of VRAM?)", rtAtlasW, rtAtlasH);
+		if (!CreateAtlasResources()) {
+			logger::error("VSM: atlas grow to {}x{} FAILED (out of VRAM?); rolling back to {}x{}", rtAtlasW, rtAtlasH, prevW, prevH);
+			rtAtlasW = prevW;
+			rtAtlasH = prevH;
+			if (prevW > 0 && prevH > 0 && !CreateAtlasResources())
+				logger::error("VSM: atlas rollback recreate to {}x{} ALSO failed — shadows unavailable until VRAM frees", prevW, prevH);
+			// The rolled-back texture is smaller than the slots step 1 just assigned: a light bump-allocated into
+			// the region beyond the rolled-back size would sample OUTSIDE the texture (edge-bleed, not clean). Drop
+			// those from this frame's shadowed set (rendered lit — fail-safe) so none samples out of bounds; they
+			// reappear when a later grow succeeds. Erase (NOT releaseSlot) their slots so the now-nonexistent region
+			// can't be recycled into freeSlots and hand out an out-of-bounds slot again.
+			size_t w = 0;
+			const size_t nPtrs = lightPtrs.size();
+			for (size_t i = 0; i < lightRecords.size(); ++i) {
+				const int fr = static_cast<int>(lightRecords[i].positionWS.w);
+				const int bw = fr * vsm::kCubeFacesWide, bh = fr * vsm::kCubeFacesTall;
+				if (lightRecords[i].atlasX + static_cast<float>(bw) > static_cast<float>(rtAtlasW) ||
+				    lightRecords[i].atlasY + static_cast<float>(bh) > static_cast<float>(rtAtlasH)) {
+					const void* id = (i < nPtrs) ? lightPtrs[i] : nullptr;
+					auto it = lightSlots.find(id);
+					if (it != lightSlots.end()) lightSlots.erase(it);
+					dirtyLights.erase(id);
+					bakedPose.erase(id);
+					continue;  // drop: its block is outside the rolled-back texture
+				}
+				if (w != i) { lightRecords[w] = lightRecords[i]; if (i < nPtrs) lightPtrs[w] = lightPtrs[i]; }
+				++w;
+			}
+			if (w < lightRecords.size()) {
+				lightRecords.resize(w);
+				if (w < lightPtrs.size()) lightPtrs.resize(w);
+				activeLightCount = static_cast<int>(w);
+			}
+		}
 	}
 }
 
@@ -931,10 +1032,14 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 		prevLightById[lightPtrs[i]] = { lightRecords[i].positionWS.x, lightRecords[i].positionWS.y, lightRecords[i].positionWS.z };
 	// Prune smoothed-position state for lights that vanished this frame (mirror prevLightById's lifetime),
 	// so a light that returns far away later SNAPS via the teleport guard rather than gliding from a stale pos.
-	if (!smoothLightById.empty()) {
+	if (!smoothLightById.empty() || !prevLightFaceRes.empty()) {
 		const std::unordered_set<const void*> seen(lightPtrs.begin(), lightPtrs.end());
 		for (auto it = smoothLightById.begin(); it != smoothLightById.end();)
 			it = seen.count(it->first) ? std::next(it) : smoothLightById.erase(it);
+		// m1: prevLightFaceRes (per-light hysteresis rung) was the one per-light map never pruned — give it the
+		// same lifetime as the others so it can't accumulate one entry per distinct BSLight* for the whole session.
+		for (auto it = prevLightFaceRes.begin(); it != prevLightFaceRes.end();)
+			it = seen.count(it->first) ? std::next(it) : prevLightFaceRes.erase(it);
 	}
 	// P2: a collected light MOVED (mv > eps) or a NEW light appeared (mv == -1) -> the cached static depth,
 	// baked in each light's cube space, is stale. Invalidate so RenderDepth re-bakes. Rare when standing still
@@ -967,11 +1072,14 @@ void VirtualShadowMaps::UploadLightBuffer()
 		// map always describes exactly the buffer LLF binds (LLF consumes both one frame later — the render tick is
 		// the Present hook, LLF's Prepass reads the previous Present's output; see docs/ARCHITECTURE §6.1). Only the
 		// n uploaded slots are mapped; everything else resolves to kNoShadowIndex (LLF renders it unshadowed).
-		lightIndexByPtr.clear();
-		lightIndexByPtr.reserve(n);
-		for (size_t i = 0; i < n; ++i)
-			if (i < lightPtrs.size() && lightPtrs[i])
-				lightIndexByPtr.emplace(lightPtrs[i], static_cast<std::uint32_t>(i));
+		{
+			std::lock_guard<std::mutex> lk(lightIndexMutex);   // guard vs GetLightShadowIndex (cross-DLL LLF read)
+			lightIndexByPtr.clear();
+			lightIndexByPtr.reserve(n);
+			for (size_t i = 0; i < n; ++i)
+				if (i < lightPtrs.size() && lightPtrs[i])
+					lightIndexByPtr.emplace(lightPtrs[i], static_cast<std::uint32_t>(i));
+		}
 		context->Unmap(lightBuffer.Get(), 0);
 	}
 }
@@ -979,10 +1087,12 @@ void VirtualShadowMaps::UploadLightBuffer()
 // LLF light-index alignment (Option c): BSLight* -> its ShadowLights (t111) slot, or kNoShadowIndex if this light
 // has no shadow record this frame. O(1) hash lookup. Called by LLF (VSM_GetLightShadowIndex export) while building
 // its light buffers; reads the map published by the previous frame's UploadLightBuffer (consistent with the buffer
-// LLF has bound this frame). No lock: the map is written only in UploadLightBuffer (Present tick) and read during
-// the next frame's LLF passes, which do not overlap.
+// LLF has bound this frame). Guarded by lightIndexMutex vs UploadLightBuffer's rebuild: today the two run on the
+// same thread a frame apart, but this is a public cross-DLL entry point, so the lock keeps it correct even if a
+// future CS path ever calls it off-thread.
 std::uint32_t VirtualShadowMaps::GetLightShadowIndex(const void* a_bsLight) const
 {
+	std::lock_guard<std::mutex> lk(lightIndexMutex);   // guard vs UploadLightBuffer's rebuild (same map)
 	const auto it = lightIndexByPtr.find(a_bsLight);
 	return it != lightIndexByPtr.end() ? it->second : kNoShadowIndex;
 }
@@ -1729,6 +1839,10 @@ void VirtualShadowMaps::BuildCasterGrid()
 		const auto& s = casterWorldSphere[i];
 		if (s.w < 0.0f)
 			continue;  // no sphere (skinned/engineOnly) -> not gridded; those draw via skinnedRanges
+		// N5: a NaN/Inf sphere (from garbage vertex data) passes the `< 0` test and would bin into an
+		// indeterminate cell (VSM_FloorDiv(NaN) -> INT_MIN). Skip it — the caster just isn't grid-culled/drawn.
+		if (!std::isfinite(s.x) || !std::isfinite(s.y) || !std::isfinite(s.z) || !std::isfinite(s.w))
+			continue;
 		if (s.w > casterGrid.maxRadius)
 			casterGrid.maxRadius = s.w;
 		const int x0 = VSM_FloorDiv(s.x - s.w, cell), x1 = VSM_FloorDiv(s.x + s.w, cell);
@@ -2284,7 +2398,7 @@ void VirtualShadowMaps::RenderDepth()
 	setPipeline();
 	RenderCasterPass(2, true);
 	RenderTranslucentPass();  // A5: glass over the completed opaque (static + dynamic) atlas
-	// engine state restored by ~GraphicsStateGuard (note: it does NOT save blend — RenderTranslucentPass restores it)
+	// All disturbed engine state (incl. blend, IA buffers, PS s0/t0/b0) restored by ~GraphicsStateGuard.
 }
 
 // A5: render one glass caster into the transmittance atlas — same WVP as the opaque path, but the PS emits the
@@ -2341,8 +2455,8 @@ void VirtualShadowMaps::RenderTranslucentPass()
 				DrawTranslucentCaster(i, faceVP, planes);
 		});
 
-	// Restore default (opaque) blend — GraphicsStateGuard does NOT save blend state, so the engine's next draws would
-	// otherwise inherit our multiplicative blend. RTV / depth / raster / VS / PS / viewport are restored by ~guard.
+	// Reset to opaque blend for the rest of our own pass sequence; ~GraphicsStateGuard restores the engine's real
+	// blend (and RTV / depth / raster / VS / PS / IA buffers / PS s0/t0/b0 / viewport) when RenderDepth returns.
 	context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
 }
 
@@ -2355,6 +2469,36 @@ void VirtualShadowMaps::RenderFrame()
 		registryDirty = true;  // force a fresh rebuild when re-enabled
 		return;
 	}
+
+	// m3: keep the on-screen size metric current if the resolution / window size changed since load (screenH
+	// feeds AssignFaceRes; it was previously captured only once at kDataLoaded). Cheap: one GetDesc per frame.
+	if (swapChain) {
+		DXGI_SWAP_CHAIN_DESC scd{};
+		if (SUCCEEDED(swapChain->GetDesc(&scd)) && scd.BufferDesc.Height != 0)
+			screenH = static_cast<float>(scd.BufferDesc.Height);
+	}
+
+	// N4: a cell / worldspace change (coc, door, fast-travel) forces an immediate registry rebuild, so casters
+	// from the previous cell (kept alive by NiPointer) stop casting at once instead of lingering up to
+	// kRebuildInterval frames until the periodic re-traversal.
+	if (auto* pc = RE::PlayerCharacter::GetSingleton()) {
+		const void* cell = pc->GetParentCell();
+		if (cell != lastPlayerCell) {
+			lastPlayerCell = cell;
+			registryDirty  = true;
+		}
+	}
+
+	// N3: consumer gate. If Community Shaders' LLF hasn't sampled our atlas for a while (feature off / absent), there
+	// is nothing to render for — skip the whole per-frame atlas build instead of wasting GPU + holding VRAM. A single
+	// fetch (NotifyResourcesFetched) resets the counter and resumes full rendering next frame. The grace covers
+	// startup (before CS's first fetch) and transient hitches so shadows are never wrongly dropped while LLF is on.
+	if (resourceFetched.exchange(false, std::memory_order_relaxed))
+		framesSinceResourceFetch = 0;
+	else if (framesSinceResourceFetch < vsm::kConsumerGraceFrames)
+		++framesSinceResourceFetch;
+	if (framesSinceResourceFetch >= vsm::kConsumerGraceFrames)
+		return;  // no consumer -> skip the atlas render (registry retained; resumes on the next fetch)
 
 	auto& smState = RE::BSShaderManager::State::GetSingleton();  // returns a reference
 	auto* ssn = smState.shadowSceneNode[0];

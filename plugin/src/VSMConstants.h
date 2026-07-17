@@ -37,7 +37,14 @@ namespace vsm
 	// non-pow2); every rung below is a power of two. Detail follows on-screen importance: a big/near light
 	// gets a high rung, a small/distant one drops to the floor — so many lights stay affordable in VRAM.
 	inline constexpr int   kFloorFaceRes    = 128;    // smallest per-light cube-face resolution = the atlas page/quantum
-	inline constexpr int   kMaxFaceResCeiling = 8192; // hard ceiling on a cube-face resolution rung (D3D max-texture guard on the iShadowMapResolution-derived top rung)
+	// Hard D3D11 2D-texture dimension limit (D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION). The packed atlas must never
+	// exceed this in either axis or CreateTexture2D fails and ALL shadows vanish; PackAtlas clamps to it and drops
+	// the least-important overflow lights (they render unshadowed — fail-safe) rather than growing past it.
+	inline constexpr int   kMaxAtlasDim     = 16384;
+	// Ceiling on a single light's cube-face resolution rung. A light's block is kCubeFacesWide (3) faces across,
+	// so the top rung MUST satisfy rung*3 <= kMaxAtlasDim or even ONE light can't fit -> = kMaxAtlasDim/3 = 5461.
+	// (Was 8192, which makes a 24576-wide block that overflows the texture limit; see ComputeAtlasDims.)
+	inline constexpr int   kMaxFaceResCeiling = kMaxAtlasDim / kCubeFacesWide;  // 5461
 	inline constexpr float kLevelHysteresis = 0.25f;  // hold a light's rung until desired res moves >25% (anti-flicker)
 	inline constexpr float kTanHalfFovV     = 0.577f; // ~60deg vertical-FOV proxy for the screen-size metric (approx; k absorbs error)
 	inline constexpr int   kAtlasBlocksWide = 4;      // packer target width = this many MAX-size light blocks across
@@ -45,6 +52,7 @@ namespace vsm
 
 	// ---- Fixed capacities / cadence ----
 	inline constexpr std::uint32_t kRebuildInterval    = 30;    // frames between scene-graph re-traversals
+	inline constexpr std::uint32_t kConsumerGraceFrames = 60;   // N3: skip the atlas render after this many frames with no LLF fetch (no consumer -> no point rendering); generous so startup/hitches never wrongly skip
 	inline constexpr std::uint64_t kSlotEvictFrames    = 90;    // free a light's persistent atlas slot after this many frames unseen (LRU)
 	inline constexpr float         kLightMoveEps       = 0.5f;  // world-units a collected light must move to invalidate the P2 static cache
 	// Moving-light shadow smoothing (aesthetics). Swinging lanterns/torches update their position in
@@ -81,4 +89,13 @@ namespace vsm
 	inline constexpr unsigned int kShadowAtlasSRVSlot = 110;  // t110: our shadow-atlas depth SRV
 	inline constexpr unsigned int kLightBufferSRVSlot = 111;  // t111: our per-light LightRecord buffer SRV
 	inline constexpr unsigned int kShadowSamplerSlot  = 7;    // s7  : our atlas sampler
+
+	// ---- CS <-> plugin ABI handshake (VSM_GetABIVersion) ----
+	// VSM and the forked Community Shaders share three binary layouts with NO runtime check: the 32-byte t111
+	// LightRecord, the 32-byte b13 VSMParams cbuffer, and CS's Light.vsmShadowIndex field/slot contract. A
+	// mismatched plugin/CS pair silently renders WRONG shadows. The plugin exports this id (VSM_GetABIVersion);
+	// a VSM-aware CS compares it to the value it was built against and refuses to bind our resources on mismatch
+	// (falling back to no VSM shadows — safe) instead of trusting a drifted layout. BUMP whenever ANY of those
+	// shared layouts changes. High byte / low bytes are just a readable major.minor; the value is opaque to CS.
+	inline constexpr std::uint32_t kABIVersion = 0x00010000u;  // v1.0 — 32B record + 32B b13 + vsmShadowIndex@Light
 }

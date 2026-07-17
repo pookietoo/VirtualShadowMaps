@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(VirtualShadowMaps VERSION 0.9.101 LANGUAGES CXX)
+project(VirtualShadowMaps VERSION 0.9.102 LANGUAGES CXX)
 
 # CommonLibSSE-NG is vendored inside the project (self-contained; relative path).
 set(CommonLibPath "${CMAKE_CURRENT_SOURCE_DIR}/../extern/CommonLibSSE-NG")

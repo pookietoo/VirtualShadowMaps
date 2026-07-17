@@ -18,6 +18,7 @@ extern "C" DLLEXPORT void VSM_GetShadowResources(
     bool*                      a_enabled)
 {
 	auto* vsm = VirtualShadowMaps::GetSingleton();
+	vsm->NotifyResourcesFetched();  // N3: LLF is sampling our atlas this frame -> keep rendering (else RenderFrame idles)
 	if (a_atlas)
 		*a_atlas = vsm->GetAtlasSRV();
 	if (a_lightBuffer)
@@ -50,6 +51,16 @@ extern "C" DLLEXPORT void VSM_GetTransmittanceResource(ID3D11ShaderResourceView*
 extern "C" DLLEXPORT std::uint32_t VSM_GetLightShadowIndex(const void* a_bsLight)
 {
 	return VirtualShadowMaps::GetSingleton()->GetLightShadowIndex(a_bsLight);
+}
+
+// ABI/version handshake for the forked Community Shaders build (see vsm::kABIVersion). Lets a VSM-aware CS read
+// our shared-layout id and refuse to bind our resources unless it matches the value CS was built against — so a
+// mismatched plugin/CS pair falls back to "no VSM shadows" (safe) instead of silently rendering WRONG shadows.
+// Additive, optional export: an older CS that never calls it is unaffected. Enforcement lives in CS (LightLimitFix
+// Prepass); this half only publishes the id.
+extern "C" DLLEXPORT std::uint32_t VSM_GetABIVersion()
+{
+	return vsm::kABIVersion;
 }
 
 namespace
@@ -96,10 +107,34 @@ namespace
 		done = true;
 	}
 
+	// Kept out of SafeRenderFrame so that function has NO C++ objects needing unwind (a hard requirement for __try).
+	void LogRenderFrameFault()
+	{
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			logger::error("VSM: exception in RenderFrame — shadow rendering skipped this frame (further occurrences suppressed)");
+		}
+	}
+
+	// SEH net around the per-frame render. RenderFrame walks live game pointers (lights, geometry renderer buffers)
+	// that can dangle on cell-transition / streaming frames; RebuildRegistry and skinning are already __try-guarded,
+	// this catches the rest so an access violation can't unwind out of Present into the game's render thread (a CTD).
+	// On a caught fault this frame's shadows are simply skipped (~GraphicsStateGuard may not run, so device state is
+	// corrected on the next good frame). NOTE: __try requires this function to hold no unwinding C++ objects.
+	void SafeRenderFrame()
+	{
+		__try {
+			VirtualShadowMaps::GetSingleton()->RenderFrame();
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			LogRenderFrameFault();
+		}
+	}
+
 	HRESULT WINAPI HookedPresent(IDXGISwapChain* a_this, UINT a_sync, UINT a_flags)
 	{
 		TryRegisterCSMenu();
-		VirtualShadowMaps::GetSingleton()->RenderFrame();
+		SafeRenderFrame();
 		return g_origPresent(a_this, a_sync, a_flags);
 	}
 
@@ -134,6 +169,15 @@ namespace
 		if (a_msg->type != SKSE::MessagingInterface::kDataLoaded)
 			return;
 
+		// Runtime gate: VSM is built and tested only for Skyrim SE/AE 1.6.x and depends on a matching (AE-only)
+		// Community Shaders + Light Limit Fix build. Skyrim VR and pre-AE (1.5.x) runtimes have different
+		// renderer/light struct layouts and are unsupported — refuse cleanly here instead of dereferencing those
+		// layouts and crashing. (SKSE would otherwise load us on any runtime; UsesNoStructs advertises no gate.)
+		if (REL::Module::IsVR() || !REL::Module::IsAE()) {
+			logger::warn("VSM: unsupported Skyrim runtime (VR or pre-AE) — Virtual Shadow Maps is disabled.");
+			return;
+		}
+
 		auto* renderer = RE::BSGraphics::Renderer::GetSingleton();
 		if (!renderer) {
 			logger::error("VSM: no BSGraphics::Renderer at kDataLoaded");
@@ -142,15 +186,17 @@ namespace
 		auto& rd = renderer->GetRuntimeData();
 		auto* device = reinterpret_cast<ID3D11Device*>(rd.forwarder);
 		auto* context = reinterpret_cast<ID3D11DeviceContext*>(rd.context);
-		auto* swapChain = reinterpret_cast<IDXGISwapChain*>(rd.renderWindows->swapChain);
-
-		if (swapChain) {
-			DXGI_SWAP_CHAIN_DESC scd{};
-			if (SUCCEEDED(swapChain->GetDesc(&scd))) {
-				VirtualShadowMaps::GetSingleton()->SetRenderSize(scd.BufferDesc.Width, scd.BufferDesc.Height);
-			}
+		auto* swapChain = rd.renderWindows ? reinterpret_cast<IDXGISwapChain*>(rd.renderWindows->swapChain) : nullptr;
+		if (!device || !context || !swapChain) {
+			logger::error("VSM: renderer not ready (device/context/swapchain null) — Virtual Shadow Maps is disabled.");
+			return;
 		}
 
+		DXGI_SWAP_CHAIN_DESC scd{};
+		if (SUCCEEDED(swapChain->GetDesc(&scd)))
+			VirtualShadowMaps::GetSingleton()->SetRenderSize(scd.BufferDesc.Width, scd.BufferDesc.Height);
+
+		VirtualShadowMaps::GetSingleton()->SetSwapChain(swapChain);  // m3: lets RenderFrame refresh screenH on a resolution change
 		VirtualShadowMaps::GetSingleton()->OnD3DReady(device, context);
 		InstallPresentHook(swapChain);
 	}

@@ -15,7 +15,7 @@ namespace vsm::internal
 	// actually running. Bump the description each build. (The SKSE plugin version number is
 	// separate — see Plugin.h / CMake project VERSION.)
 	inline constexpr char kBuildTag[] =
-	    "0.9.101 - code-review cleanup: dead dev-diagnostics + id/preview atlases stripped, t111 shrunk to a 32-byte GPU record (cubeVP CPU-only), shadow atlas depth-only; deploy = attribution-only in the CS Lighting category, no config file.";
+	    "0.9.102 - compatibility hardening (UNTESTED): atlas bounded to the D3D11 16384 limit, VR/pre-AE runtime gate, SEH frame guard, full render-state restore, and cross-DLL hardening.";
 
 	// Depth convention for the shadow atlas. TRUE = reverse-Z (near->1, far->0), which is Skyrim's own
 	// main-view convention and gives uniform float-depth precision across the light's range. This flag is the
@@ -41,7 +41,12 @@ namespace vsm::internal
 		    t.translate.x, t.translate.y, t.translate.z, 1.0f);
 	}
 
-	// Save/restore the graphics-stage state our draw/preview passes disturb.
+	// Save/restore the graphics-stage state our draw/preview passes disturb. Because our passes run at Present
+	// time (before the game's original Present chain — where ENB does its post-processing), any state we leave
+	// dirty is inherited by ENB and the next engine frame; this guard must therefore cover EVERY stage the
+	// passes touch. The set below matches what RenderDepth / RenderCasterPass / the A6 alpha path / the A5
+	// translucent path actually mutate: OM (RTV/DSV, blend, depth-stencil), RS (state, viewports), IA (layout,
+	// topology, vertex/index buffers), VS (shader, CB0) and PS (shader, sampler s0, SRV t0, CB0).
 	struct GraphicsStateGuard
 	{
 		ID3D11DeviceContext* ctx;
@@ -57,6 +62,18 @@ namespace vsm::internal
 		ComPtr<ID3D11VertexShader> vs;
 		ComPtr<ID3D11PixelShader> ps;
 		ID3D11Buffer* vsCB0 = nullptr;
+		// Added coverage (previously leaked into ENB / the next frame):
+		ID3D11BlendState* blend = nullptr;
+		FLOAT             blendFactor[4]{};
+		UINT              sampleMask = 0xFFFFFFFFu;
+		ID3D11Buffer*     vb0 = nullptr;                 // IA vertex buffer slot 0
+		UINT              vbStride = 0, vbOffset = 0;
+		ID3D11Buffer*     ib = nullptr;                  // IA index buffer
+		DXGI_FORMAT       ibFormat = DXGI_FORMAT_UNKNOWN;
+		UINT              ibOffset = 0;
+		ID3D11SamplerState*       psSamp0 = nullptr;     // PS sampler s0 (A6 alpha diffuse sampler)
+		ID3D11ShaderResourceView* psSrv0  = nullptr;     // PS SRV t0     (A6 diffuse SRV)
+		ID3D11Buffer*             psCB0   = nullptr;     // PS constant buffer b0 (A5 translucent pass)
 
 		explicit GraphicsStateGuard(ID3D11DeviceContext* c) : ctx(c)
 		{
@@ -69,6 +86,12 @@ namespace vsm::internal
 			ctx->VSGetShader(&vs, nullptr, nullptr);
 			ctx->PSGetShader(&ps, nullptr, nullptr);
 			ctx->VSGetConstantBuffers(0, 1, &vsCB0);
+			ctx->OMGetBlendState(&blend, blendFactor, &sampleMask);
+			ctx->IAGetVertexBuffers(0, 1, &vb0, &vbStride, &vbOffset);
+			ctx->IAGetIndexBuffer(&ib, &ibFormat, &ibOffset);
+			ctx->PSGetSamplers(0, 1, &psSamp0);
+			ctx->PSGetShaderResources(0, 1, &psSrv0);
+			ctx->PSGetConstantBuffers(0, 1, &psCB0);
 		}
 		~GraphicsStateGuard()
 		{
@@ -85,6 +108,18 @@ namespace vsm::internal
 			ctx->PSSetShader(ps.Get(), nullptr, 0);
 			ctx->VSSetConstantBuffers(0, 1, &vsCB0);
 			if (vsCB0) vsCB0->Release();
+			ctx->OMSetBlendState(blend, blendFactor, sampleMask);
+			if (blend) blend->Release();
+			ctx->IASetVertexBuffers(0, 1, &vb0, &vbStride, &vbOffset);
+			if (vb0) vb0->Release();
+			ctx->IASetIndexBuffer(ib, ibFormat, ibOffset);
+			if (ib) ib->Release();
+			ctx->PSSetSamplers(0, 1, &psSamp0);
+			if (psSamp0) psSamp0->Release();
+			ctx->PSSetShaderResources(0, 1, &psSrv0);
+			if (psSrv0) psSrv0->Release();
+			ctx->PSSetConstantBuffers(0, 1, &psCB0);
+			if (psCB0) psCB0->Release();
 		}
 	};
 

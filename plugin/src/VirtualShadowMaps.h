@@ -19,7 +19,9 @@
 #include <DirectXMath.h>
 #include <d3d11.h>
 #include <d3d11_1.h>   // ID3D11DeviceContext1 for P1a batched-draw offset-bound cbuffer submit
+#include <atomic>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -42,6 +44,7 @@ public:
 
 	void OnD3DReady(ID3D11Device* a_device, ID3D11DeviceContext* a_context);
 	void SetRenderSize(std::uint32_t, std::uint32_t a_h) { screenH = static_cast<float>(a_h); }
+	void SetSwapChain(IDXGISwapChain* a_sc) { swapChain = a_sc; }  // not owned; used to refresh screenH on a resolution change
 	void RenderFrame();  // per-frame, from the Present hook
 	void DrawMenu();     // ImGui, called from the CS menu via our registered callback
 
@@ -53,6 +56,11 @@ public:
 	ID3D11Buffer*             GetParamsCB() const { return paramsCB.Get(); }
 	int  GetShadowLightCount() const { return static_cast<int>(lightRecords.size()); }
 	bool IsEnabled() const { return enabled; }
+	// N3: Community Shaders' LightLimitFix::Prepass calls VSM_GetShadowResources every frame it samples our atlas.
+	// It stamps this flag so RenderFrame can skip the whole atlas render when nothing is consuming it (LLF off /
+	// absent) — otherwise we'd render + hold a full atlas for zero output. Set from the CS render thread, read+reset
+	// on our Present tick; atomic so it's safe regardless of which thread CS calls the export on.
+	void NotifyResourcesFetched() { resourceFetched.store(true, std::memory_order_relaxed); }
 	// LLF light-index alignment (Option c): map a BSLight* to its slot in the ShadowLights (t111) buffer, so
 	// LLF's Lighting.hlsl can index our shadow record directly instead of an O(lights²)/pixel position search.
 	// Returns kNoShadowIndex when this light has no shadow record this frame (LLF renders it unshadowed — the
@@ -141,6 +149,7 @@ private:
 	// cached engine D3D (not owned)
 	ID3D11Device*        device = nullptr;
 	ID3D11DeviceContext* context = nullptr;
+	IDXGISwapChain*      swapChain = nullptr;  // not owned; only queried (GetDesc) to keep screenH current on a resolution change
 
 	// Runtime atlas dimensions, derived from the game's iShadowMapResolution ini at startup (compile-time
 	// vsm::kFaceRes etc. are the fallback). Lets the per-cube-face resolution track the user's shadow-quality
@@ -391,7 +400,11 @@ private:
 	std::vector<const void*>       lightPtrs;      // parallel to lightRecords: the BSLight* identity
 	// LLF light-index alignment (Option c): BSLight* -> its slot in ShadowLights (t111). Rebuilt in
 	// UploadLightBuffer (atomic with the GPU upload) from lightPtrs. Read via GetLightShadowIndex by LLF.
+	// The mutex guards the write (UploadLightBuffer, our Present tick) against the read (GetLightShadowIndex,
+	// called from CS's LLF Prepass): today they run on the same thread a frame apart, but the export is a public
+	// cross-DLL entry point, so a lock makes the read safe even if a future CS path ever calls it off-thread.
 	std::unordered_map<const void*, std::uint32_t> lightIndexByPtr;
+	mutable std::mutex                             lightIndexMutex;
 	std::unordered_map<const void*, DirectX::XMFLOAT3> prevLightById;  // BSLight* -> last-frame world pos
 	std::unordered_map<const void*, DirectX::XMFLOAT3> smoothLightById;  // BSLight* -> SMOOTHED cube center (aesthetics: de-step swinging lights; see vsm::kLightSmoothAlpha)
 	float lightSmoothAlpha = vsm::kLightSmoothAlpha;  // live moving-light smoothing strength (DEV slider tunes it; deploy = the constant)
@@ -415,5 +428,15 @@ private:
 
 	bool resourcesReady = false;
 	bool haveLights  = false;
+
+	// N3: consumer gate. resourceFetched is set by NotifyResourcesFetched (CS Prepass) and read+reset each
+	// RenderFrame; framesSinceResourceFetch counts frames with no fetch, so we skip the render once nothing has
+	// sampled our atlas for kConsumerGraceFrames (LLF off/absent). The grace keeps us rendering through startup
+	// and any transient hitch, and any single fetch resumes full rendering on the next frame.
+	std::atomic<bool> resourceFetched{ false };
+	std::uint32_t     framesSinceResourceFetch = 0;
+	// N4: last player parent cell (opaque pointer identity). A change (coc / door / fast-travel) forces an
+	// immediate registry rebuild so stale casters from the previous cell stop casting at once.
+	const void*       lastPlayerCell = nullptr;
 
 };
