@@ -15,7 +15,7 @@ namespace vsm::internal
 	// actually running. Bump the description each build. (The SKSE plugin version number is
 	// separate — see Plugin.h / CMake project VERSION.)
 	inline constexpr char kBuildTag[] =
-	    "0.9.102 - compatibility hardening (UNTESTED): atlas bounded to the D3D11 16384 limit, VR/pre-AE runtime gate, SEH frame guard, full render-state restore, and cross-DLL hardening.";
+	    "0.9.103 - A5 O(lights²)->O(1) BSLight* light dedup on the 0.9.102 compatibility-hardening base; per-phase profiler kept dev-only.";
 
 	// Depth convention for the shadow atlas. TRUE = reverse-Z (near->1, far->0), which is Skyrim's own
 	// main-view convention and gives uniform float-depth precision across the light's range. This flag is the

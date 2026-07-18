@@ -892,7 +892,11 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 	float nearestDistSq = FLT_MAX;
 	int   nearestIdx    = -1;
 
-	// Add one scene-graph light to the buffer, deduped by world position (a light can appear
+	// A5: O(1) dedup by BSLight* identity (a light can appear in BOTH activeLights and activeShadowLights).
+	// Replaces the old O(lights²) per-add position scan over lightRecords — a free win at high light counts.
+	std::unordered_set<RE::BSLight*> seenLights;
+
+	// Add one scene-graph light to the buffer, deduped by BSLight* identity (a light can appear
 	// in both arrays). ALWAYS returns true (no light cap; the bool is a vestige of the old capped design). We collect
 	// BOTH activeLights AND activeShadowLights — matching LLF's light set exactly — so
 	// shadow-casting lights (braziers etc., which live in activeShadowLights) also get cubes.
@@ -903,6 +907,8 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 		// and per-light variable resolution keeps it small (see notes/VSM_VARIABLE_RESOLUTION.md).
 		if (!bl || bl == rt.sunLight)
 			return;
+		if (!seenLights.insert(bl).second)
+			return;  // A5: already processed this BSLight (present in both arrays) -> O(1) identity dedup
 		// Only genuine shadow-casters — skip ambient/fill lights (the engine's own flags). Shadowing every
 		// illuminating light rather than just casters produces "shadows from nowhere".
 		if (bl->ambientLight)
@@ -925,9 +931,7 @@ void VirtualShadowMaps::CollectLights(RE::ShadowSceneNode* a_ssn)
 		const RE::NiPoint3& p = niLight->world.translate;
 		if (p.x == 0.0f && p.y == 0.0f && p.z == 0.0f)
 			return;
-		for (const auto& rec : lightRecords)  // dedup: same light already added via the other array
-			if (rec.positionWS.x == p.x && rec.positionWS.y == p.y && rec.positionWS.z == p.z)
-				return;
+		// (A5: the former O(lights²) position dedup here is gone — seenLights above dedups by BSLight* identity.)
 
 		const float    radius = niLight->GetLightRuntimeData().radius.x;  // this light's actual reach
 		// P3 broad-phase (cullCasters): drop lights that cast NO visible shadow — entirely behind the camera or
@@ -2524,7 +2528,6 @@ void VirtualShadowMaps::RenderFrame()
 	// rasterize into every light face below). Cheap no-op if there are no skinned casters.
 	SkinAllCasters();        // CPU-skin engineOnly casters -> world-absolute posed buffer (consumed by RenderDepth)
 	RenderDepth();           // render every light's cube into the atlas (clears if no lights)
-
 }
 
 void VirtualShadowMaps::DrawMenu()

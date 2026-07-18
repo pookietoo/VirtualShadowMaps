@@ -9,10 +9,16 @@
 Skyrim only allows shadows from a handful of local lights at once. Virtual Shadow Maps is an
 [SKSE](https://skse.silverlock.org/) plugin that renders its **own** cube-shadow atlas
 for the active local lights the engine dropped, and feeds it to
-[Community Shaders](https://github.com/doodlum/skyrim-community-shaders)' Light Limit Fix so its
-`Lighting.hlsl` samples our shadows. It is not standalone: it depends on Community Shaders and its
-Light Limit Fix and cannot run without them (see [Installing](#installing) and
+[Community Shaders](https://github.com/doodlum/skyrim-community-shaders) so its
+`Lighting.hlsl` samples our shadows. It is **not standalone**: it depends **entirely** on Community
+Shaders and does nothing without it — all of its output is produced inside Community Shaders'
+rendering (see [Installing](#installing) and
 [Relationship to Community Shaders](#relationship-to-community-shaders)).
+
+> [!NOTE]
+> This is a separate, **unofficial** mod. It is **not affiliated with, endorsed by, or part of**
+> Community Shaders or its authors. We would love for it to become part of the
+> Community Shaders project one day, but there is no association today.
 
 ## Status
 
@@ -40,7 +46,7 @@ alpha-tested cutout transparency for hair cards is not wired for skinned meshes 
 
 ## Installing
 
-Requires **Community Shaders** with **Light Limit Fix**. Virtual Shadow Maps ships a companion
+Requires **Community Shaders**. Virtual Shadow Maps ships a companion
 `CommunityShaders.dll` and shader overrides, so it must match the Community Shaders version it targets
 (currently **v1.7.3**); mixing versions can break local-light shadows.
 
@@ -56,8 +62,9 @@ prior shadow settings carry over.
 
 ## Relationship to Community Shaders
 
-Virtual Shadow Maps is a companion to Community Shaders' **Light Limit Fix (LLF)**, not a replacement,
-and depends on it at runtime. Our own logic stays in `VirtualShadowMaps.dll`; the companion
+Virtual Shadow Maps is a companion to Community Shaders' built-in **Light Limit Fix (LLF)** feature,
+not a replacement, and depends on Community Shaders at runtime. Our own logic stays in
+`VirtualShadowMaps.dll`; the companion
 `CommunityShaders.dll` and shader overrides carry only small, `// VSM`-tagged edits, of three kinds:
 
 - **A generic add-on menu hook** (`Menu.cpp`, `Menu.h`, `FeatureListRenderer.cpp`) — two exports plus
@@ -70,10 +77,9 @@ and depends on it at runtime. Our own logic stays in `VirtualShadowMaps.dll`; th
 - **Local-light shadow sampling in `Lighting.hlsl`** — the shader calls `VSM::GetLocalShadow` per
   local light and skips the engine's own local shadow mask.
 
-Because VSM aligns its per-light data to LLF's light ordering, the CS shaders and `CommunityShaders.dll`
-must match the VSM build. A Community Shaders / Light Limit Fix update that changes how LLF gathers or
-orders its lights needs a matching VSM update; a mismatched build can produce wrong or missing
-local-light shadows.
+Because VSM aligns its per-light data to LLF's lights, the CS shaders and `CommunityShaders.dll`
+must match the VSM build. A Community Shaders update that changes how LLF gathers or orders its lights
+needs a matching VSM update; a mismatched build can produce wrong or missing local-light shadows.
 
 The menu hook is feature-agnostic and could be upstreamed as a general extension point. The Light
 Limit Fix and shader changes are VSM-specific and would be offered as an optional, VSM-aware path
